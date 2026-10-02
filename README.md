@@ -335,8 +335,27 @@ curl -s -X POST http://127.0.0.1:8080/rules \
 
 ### `GET /events`
 
-Returns every event in sequence order. `?rule_id=` and `?device_id=` filter the
-result; any other query parameter is rejected.
+Returns events in ascending `sequence` order; with no parameters every event is
+returned. All enabled filters are intersected:
+
+- `rule_id` and `device_id` filter by exact value;
+- `event` and `source` filter by exact, complete string and must not be empty;
+- `occurred_after` and `occurred_before` are RFC3339 UTC timestamps ending in
+  `Z` and select the half-open range `occurred_at >= occurred_after` and
+  `occurred_at < occurred_before`; `occurred_after` must be strictly earlier
+  than `occurred_before`;
+- `after_sequence` returns only events whose `sequence` is greater;
+- `limit` is an integer between 1 and 1000 bounding the number returned.
+
+Any unknown parameter, an empty `event` or `source`, a timestamp not ending in
+`Z`, `occurred_after` at or after `occurred_before`, a non-integer or unsafe
+`after_sequence`, or a `limit` outside 1 to 1000 is rejected with
+`400 validation_error` naming the parameter.
+
+Paginate with the last event's `sequence`: fetch
+`/events?limit=100&after_sequence=<last sequence>` for the next page. Results
+are stable: events sharing an `occurred_at` are still ordered by `sequence`,
+and repeating a query against an unchanged event set returns the same events.
 
 ```json
 {"events":[{"sequence":1,"rule_id":"hot","event":"temperature_high","source":"shadow","device_id":"sensor-1","topic":null,"value":31,"occurred_at":"2024-05-01T10:00:00.000Z"}]}

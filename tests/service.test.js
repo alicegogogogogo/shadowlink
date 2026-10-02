@@ -110,7 +110,7 @@ test("rules turn shadow updates into events", async () => {
     });
     const filtered = await (await fetch(`${started.httpUrl}/events?device_id=device-1&rule_id=hot`)).json();
     assert.equal(filtered.events.length, 1);
-    const unknownQuery = await fetch(`${started.httpUrl}/events?limit=1`);
+    const unknownQuery = await fetch(`${started.httpUrl}/events?bogus=1`);
     assert.equal(unknownQuery.status, 400);
     assert.equal((await unknownQuery.json()).error.code, "validation_error");
   });

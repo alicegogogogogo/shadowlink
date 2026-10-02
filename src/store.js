@@ -130,7 +130,20 @@ export class Store {
     return { sequence: Number(info.lastInsertRowid), ...event };
   }
 
-  listEvents({ ruleId = null, deviceId = null } = {}) {
+  listEvents({
+    ruleId = null,
+    deviceId = null,
+    event = null,
+    source = null,
+    occurredAfter = null,
+    occurredBefore = null,
+    afterSequence = null,
+    limit = null,
+  } = {}) {
+    // occurred_at is canonical RFC3339 UTC ending in Z; removing the Z yields
+    // the form julianday() reads, so the half-open window is exact down to the
+    // millisecond rather than a lexical comparison.
+    const windowOf = () => "julianday(substr(occurred_at, 1, length(occurred_at) - 1))";
     const clauses = [];
     const parameters = [];
     if (ruleId !== null) {
@@ -141,9 +154,33 @@ export class Store {
       clauses.push("device_id = ?");
       parameters.push(deviceId);
     }
+    if (event !== null) {
+      clauses.push("event = ?");
+      parameters.push(event);
+    }
+    if (source !== null) {
+      clauses.push("source = ?");
+      parameters.push(source);
+    }
+    if (occurredAfter !== null) {
+      clauses.push(`${windowOf()} >= julianday(?)`);
+      parameters.push(occurredAfter);
+    }
+    if (occurredBefore !== null) {
+      clauses.push(`${windowOf()} < julianday(?)`);
+      parameters.push(occurredBefore);
+    }
+    if (afterSequence !== null) {
+      clauses.push("sequence > ?");
+      parameters.push(afterSequence);
+    }
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    if (limit !== null) {
+      parameters.push(limit);
+    }
+    const cap = limit === null ? "" : " LIMIT ?";
     return this.database
-      .prepare(`SELECT * FROM events${where} ORDER BY sequence`)
+      .prepare(`SELECT * FROM events${where} ORDER BY sequence${cap}`)
       .all(...parameters)
       .map((row) => ({
         sequence: row.sequence,

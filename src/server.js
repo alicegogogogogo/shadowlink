@@ -7,10 +7,120 @@ import { NotFoundError, ShadowlinkError, ValidationError } from "./errors.js";
 import { Service } from "./service.js";
 
 const MAX_BODY_BYTES = 1000000;
-const QUERY_FIELDS = new Map([
-  ["rule_id", "ruleId"],
-  ["device_id", "deviceId"],
+const QUERY_FIELDS = new Set([
+  "rule_id",
+  "device_id",
+  "event",
+  "source",
+  "occurred_after",
+  "occurred_before",
+  "after_sequence",
+  "limit",
 ]);
+const RFC3339_UTC = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
+const NON_NEGATIVE_INTEGER = /^(?:0|[1-9][0-9]*)$/;
+const POSITIVE_INTEGER = /^[1-9][0-9]*$/;
+
+function requireNonEmpty(name, value) {
+  if (value === "") {
+    throw new ValidationError(`${name} query parameter must not be empty`);
+  }
+}
+
+/**
+ * Parse a strict RFC3339 UTC timestamp (the only shape occurred_at is written
+ * in). V8's parser rolls impossible calendar values over, so a canonical
+ * round trip is required. Returns the canonical form without the trailing Z,
+ * which is the shape julianday() compares against.
+ */
+function parseTimeParameter(name, value) {
+  const match = RFC3339_UTC.exec(value);
+  if (match === null) {
+    throw new ValidationError(`${name} query parameter must be an RFC3339 UTC timestamp ending in Z`);
+  }
+  const [, year, month, day, hour, minute, second, fractionRaw] = match;
+  const fraction = fractionRaw ?? "";
+  // Events are stamped at millisecond precision, so a boundary with nonzero
+  // sub-millisecond digits could never be honored exactly; reject it rather
+  // than truncating it silently.
+  if (fraction.length > 3 && fraction.slice(3) !== "0".repeat(fraction.length - 3)) {
+    throw new ValidationError(`${name} query parameter must be an RFC3339 UTC timestamp ending in Z`);
+  }
+  const canonical = `${year}-${month}-${day}T${hour}:${minute}:${second}.${fraction.padEnd(3, "0").slice(0, 3)}Z`;
+  const parsed = new Date(canonical);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== canonical) {
+    throw new ValidationError(`${name} query parameter must be an RFC3339 UTC timestamp ending in Z`);
+  }
+  return { withoutZ: canonical.slice(0, -1), millis: parsed.getTime() };
+}
+
+function parseSequenceParameter(value) {
+  if (!NON_NEGATIVE_INTEGER.test(value)) {
+    throw new ValidationError("after_sequence query parameter must be a safe non-negative integer");
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw new ValidationError("after_sequence query parameter must be a safe non-negative integer");
+  }
+  return number;
+}
+
+function parseLimitParameter(value) {
+  if (!POSITIVE_INTEGER.test(value)) {
+    throw new ValidationError("limit query parameter must be an integer between 1 and 1000");
+  }
+  const number = Number(value);
+  if (number > 1000) {
+    throw new ValidationError("limit query parameter must be an integer between 1 and 1000");
+  }
+  return number;
+}
+
+function readQuery(url) {
+  const query = {};
+  for (const [name, value] of url.searchParams) {
+    if (!QUERY_FIELDS.has(name)) {
+      throw new ValidationError(`unknown query parameter ${name}`);
+    }
+    if (Object.hasOwn(query, name)) {
+      throw new ValidationError(`${name} query parameter must appear at most once`);
+    }
+    switch (name) {
+      case "event":
+      case "source":
+        requireNonEmpty(name, value);
+        query[name] = value;
+        break;
+      case "occurred_after":
+      case "occurred_before":
+        query[name] = parseTimeParameter(name, value);
+        break;
+      case "after_sequence":
+        query[name] = parseSequenceParameter(value);
+        break;
+      case "limit":
+        query[name] = parseLimitParameter(value);
+        break;
+      default:
+        query[name] = value;
+    }
+  }
+  const after = query.occurred_after;
+  const before = query.occurred_before;
+  if (after !== undefined && before !== undefined && after.millis >= before.millis) {
+    throw new ValidationError("occurred_after query parameter must be earlier than occurred_before");
+  }
+  return {
+    ruleId: query.rule_id,
+    deviceId: query.device_id,
+    event: query.event,
+    source: query.source,
+    occurredAfter: after?.withoutZ,
+    occurredBefore: before?.withoutZ,
+    afterSequence: query.after_sequence,
+    limit: query.limit,
+  };
+}
 
 async function readJson(request) {
   const contentType = (request.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
@@ -31,18 +141,6 @@ async function readJson(request) {
   } catch {
     throw new ValidationError("request body must be valid JSON");
   }
-}
-
-function readQuery(url) {
-  const query = {};
-  for (const [name, value] of url.searchParams) {
-    const field = QUERY_FIELDS.get(name);
-    if (field === undefined) {
-      throw new ValidationError(`unknown query parameter ${name}`);
-    }
-    query[field] = value;
-  }
-  return query;
 }
 
 function readSegments(url) {

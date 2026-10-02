@@ -107,7 +107,18 @@ export class Service {
     if (query.deviceId !== undefined && query.deviceId !== null) {
       identifier(query.deviceId, "device id");
     }
-    return { events: this.store.listEvents({ ruleId: query.ruleId ?? null, deviceId: query.deviceId ?? null }) };
+    return {
+      events: this.store.listEvents({
+        ruleId: query.ruleId ?? null,
+        deviceId: query.deviceId ?? null,
+        event: query.event ?? null,
+        source: query.source ?? null,
+        occurredAfter: query.occurredAfter ?? null,
+        occurredBefore: query.occurredBefore ?? null,
+        afterSequence: query.afterSequence ?? null,
+        limit: query.limit ?? null,
+      }),
+    };
   }
 
   /**
