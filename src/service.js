@@ -6,6 +6,7 @@ import { Store } from "./store.js";
 import { mergeValues } from "./values.js";
 
 const SHADOW_PREFIX = "$shadow/";
+const TELEMETRY_PREFIX = "$telemetry/";
 
 function byId(left, right) {
   return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
@@ -122,11 +123,53 @@ export class Service {
   }
 
   /**
+   * Aggregate the stored numeric samples of one device and metric into fixed
+   * width buckets aligned to the Unix epoch. Only buckets that hold at least
+   * one sample are returned, in ascending start order.
+   */
+  telemetry(rawDeviceId, query) {
+    const deviceId = identifier(rawDeviceId, "device id");
+    const metric = identifier(query.metric, "metric");
+    const samples = this.store.listTelemetrySamples(deviceId, metric, query.fromMillis, query.toMillis);
+    const buckets = new Map();
+    for (const sample of samples) {
+      const start = Math.floor(Math.floor(sample.ts / 1000) / query.bucketSeconds) * query.bucketSeconds;
+      const bucket = buckets.get(start) ?? { count: 0, sum: 0, min: sample.value, max: sample.value };
+      bucket.count += 1;
+      bucket.sum += sample.value;
+      if (sample.value < bucket.min) {
+        bucket.min = sample.value;
+      }
+      if (sample.value > bucket.max) {
+        bucket.max = sample.value;
+      }
+      buckets.set(start, bucket);
+    }
+    return {
+      device_id: deviceId,
+      metric,
+      from: query.from,
+      to: query.to,
+      bucket_seconds: query.bucketSeconds,
+      aggregate: query.aggregate,
+      buckets: [...buckets.entries()]
+        .sort((left, right) => left[0] - right[0])
+        .map(([start, bucket]) => ({
+          start: new Date(start * 1000).toISOString(),
+          end: new Date((start + query.bucketSeconds) * 1000).toISOString(),
+          value: aggregateValue(query.aggregate, bucket),
+          count: bucket.count,
+        })),
+    };
+  }
+
+  /**
    * Called by the broker for every routed publication: the reserved shadow
    * topic is applied first, then mqtt-scoped rules are evaluated once for the
    * published topic.
    */
   handlePublish(topic, payload) {
+    this.#captureTelemetry(topic, payload);
     if (topic.startsWith(SHADOW_PREFIX)) {
       const parts = topic.split("/");
       if (parts.length === 3 && parts[2] === "update" && parts[1] !== "") {
@@ -150,6 +193,39 @@ export class Service {
         this.#emit(rule, { device_id: null, topic, value: matchedValue(rule, observation) });
       }
     }
+  }
+
+  /**
+   * Save a telemetry sample for a publication to
+   * `$telemetry/<deviceId>/<metric>` whose UTF-8 payload is a single finite
+   * JSON number and whose identifiers are valid. Anything else is still routed
+   * normally (retained handling, fan-out and mqtt rules) but stores no sample;
+   * telemetry never creates a shadow or emits an event.
+   */
+  #captureTelemetry(topic, payload) {
+    if (!topic.startsWith(TELEMETRY_PREFIX)) {
+      return;
+    }
+    const parts = topic.split("/");
+    if (parts.length !== 3 || parts[1] === "" || parts[2] === "") {
+      return;
+    }
+    try {
+      identifier(parts[1], "device id");
+      identifier(parts[2], "metric");
+    } catch {
+      return;
+    }
+    let value;
+    try {
+      value = JSON.parse(payload.toString("utf8"));
+    } catch {
+      return;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return;
+    }
+    this.store.insertTelemetrySample(parts[1], parts[2], Date.parse(this.now()), value);
   }
 
   #idempotent(key, operation, action) {
@@ -210,5 +286,22 @@ export class Service {
       value,
       occurred_at: this.now(),
     });
+  }
+}
+
+function aggregateValue(aggregate, bucket) {
+  switch (aggregate) {
+    case "avg":
+      return bucket.sum / bucket.count;
+    case "min":
+      return bucket.min;
+    case "max":
+      return bucket.max;
+    case "sum":
+      return bucket.sum;
+    case "count":
+      return bucket.count;
+    default:
+      throw new ValidationError(`aggregate must be one of avg, min, max, sum, count`);
   }
 }

@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS idempotency (
   operation TEXT NOT NULL,
   response TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telemetry_samples (
+  device_id TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  value REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS telemetry_samples_query
+  ON telemetry_samples (device_id, metric, ts);
 `;
 
 export class Store {
@@ -194,8 +202,30 @@ export class Store {
       }));
   }
 
-  putRetained(topic, payload, qos) {
+  insertTelemetrySample(deviceId, metric, millis, value) {
     this.database
+      .prepare("INSERT INTO telemetry_samples (device_id, metric, ts, value) VALUES (?, ?, ?, ?)")
+      .run(deviceId, metric, millis, value);
+  }
+
+  /**
+   * Samples for one device and metric over the half-open window
+   * [fromMillis, toMillis), in arrival order. Ties at one millisecond keep the
+   * SQLite row order, so the same database and parameters always aggregate to
+   * the same result.
+   */
+  listTelemetrySamples(deviceId, metric, fromMillis, toMillis) {
+    return this.database
+      .prepare(
+        `SELECT ts, value, rowid AS row_id FROM telemetry_samples
+         WHERE device_id = ? AND metric = ? AND ts >= ? AND ts < ?
+         ORDER BY ts, row_id`,
+      )
+      .all(deviceId, metric, fromMillis, toMillis)
+      .map((row) => ({ ts: row.ts, value: row.value }));
+  }
+
+  putRetained(topic, payload, qos) {    this.database
       .prepare(
         `INSERT INTO retained (topic, payload, qos) VALUES (?, ?, ?)
          ON CONFLICT(topic) DO UPDATE SET payload = excluded.payload, qos = excluded.qos`,

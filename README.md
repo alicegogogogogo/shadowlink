@@ -175,6 +175,16 @@ The broker itself publishes on two topics under `$shadow/`:
   whose device id is not a valid identifier, is routed but ignored.
 - `$shadow/<deviceId>/delta` — after an accepted write whose `delta` is not
   empty, the broker publishes the delta as JSON at QoS 0 with `RETAIN` clear.
+- `$telemetry/<deviceId>/<metric>` — a client `PUBLISH` whose UTF-8 payload is a
+  single JSON number records one numeric sample for that device and metric,
+  timestamped at the moment the broker receives it. The publication is still
+  routed to subscribers and evaluated by `mqtt` rules like any other message;
+  telemetry never writes an event or creates a shadow. A topic that is not
+  exactly these three non-empty segments, an identifier that is invalid, or a
+  payload that is not a finite JSON number (`NaN` and `Infinity` included)
+  stores no sample but is otherwise processed as an ordinary publication, with
+  no new protocol error. QoS 0 and QoS 1 keep their usual delivery and
+  retransmission de-duplication, so a redelivered QoS 1 packet samples once.
 
 ## Device shadows
 
@@ -323,6 +333,39 @@ curl -s -X POST http://127.0.0.1:8080/devices/sensor-1/reported \
 
 Returns the current document, or `404` when the device has never reported.
 
+### `GET /devices/{deviceId}/telemetry`
+
+Aggregates the numeric samples received on
+`$telemetry/<deviceId>/<metric>` into fixed-width buckets aligned to the Unix
+epoch. The query takes exactly these five parameters:
+
+- `metric` — the metric identifier, using the same identifier rule as a device
+  id;
+- `from` and `to` — RFC3339 UTC timestamps ending in `Z`; samples satisfy
+  `from <= received_at < to`, so `from` is inclusive and `to` exclusive;
+- `bucket_seconds` — an integer bucket width from `1` to `86400`;
+- `aggregate` — one of `avg`, `min`, `max`, `sum`, `count`.
+
+Buckets are ordered by ascending `start` and only non-empty buckets are
+returned; each bucket carries its `start`, the exclusive `end` boundary, the
+aggregated `value` and the sample `count`. Times are RFC3339 UTC ending in `Z`.
+With no matching samples — including a device that has never published — the
+response is `200` with `"buckets": []`; the call never creates a shadow and
+never writes an event. Repeating the same query against an unchanged store
+returns the same buckets.
+
+```bash
+curl -s 'http://127.0.0.1:8080/devices/sensor-1/telemetry?metric=temp&from=2024-05-01T10:00:00Z&to=2024-05-01T11:00:00Z&bucket_seconds=60&aggregate=avg'
+```
+```json
+{"device_id":"sensor-1","metric":"temp","from":"2024-05-01T10:00:00.000Z","to":"2024-05-01T11:00:00.000Z","bucket_seconds":60,"aggregate":"avg","buckets":[{"start":"2024-05-01T10:00:00.000Z","end":"2024-05-01T10:01:00.000Z","value":21.5,"count":2}]}
+```
+
+Any missing, duplicated or unknown parameter, a timestamp that is not RFC3339
+UTC `Z`, a `from` at or after `to`, a `bucket_seconds` outside 1–86400, an
+unknown `aggregate`, or an invalid device id or metric is rejected with
+`400 validation_error`.
+
 ### `POST /rules`
 
 Creates a rule and returns it with status `201`. A duplicate rule id is `409`.
@@ -380,6 +423,6 @@ and repeating a query against an unchanged event set returns the same events.
 node --test tests/
 ```
 
-`node --test` and `node --test "tests/*.test.js"` run the same 43 tests;
+`node --test` and `node --test "tests/*.test.js"` run the same 107 tests;
 `tests/index.js` exists so the directory form also works on Node 22, which does
 not expand a directory argument on its own.

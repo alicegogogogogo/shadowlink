@@ -20,6 +20,8 @@ const QUERY_FIELDS = new Set([
 const RFC3339_UTC = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
 const NON_NEGATIVE_INTEGER = /^(?:0|[1-9][0-9]*)$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]*$/;
+const TELEMETRY_QUERY_FIELDS = new Set(["metric", "from", "to", "bucket_seconds", "aggregate"]);
+const TELEMETRY_AGGREGATES = new Set(["avg", "min", "max", "sum", "count"]);
 
 function requireNonEmpty(name, value) {
   if (value === "") {
@@ -51,7 +53,7 @@ function parseTimeParameter(name, value) {
   if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== canonical) {
     throw new ValidationError(`${name} query parameter must be an RFC3339 UTC timestamp ending in Z`);
   }
-  return { withoutZ: canonical.slice(0, -1), millis: parsed.getTime() };
+  return { canonical, withoutZ: canonical.slice(0, -1), millis: parsed.getTime() };
 }
 
 function parseSequenceParameter(value) {
@@ -122,6 +124,54 @@ function readQuery(url) {
   };
 }
 
+/**
+ * Parse the exact five telemetry parameters: metric, from, to,
+ * bucket_seconds and aggregate. Missing, duplicated or unknown parameters, a
+ * bad timestamp or bucket width, an invalid aggregate, or a non-ascending
+ * window are rejected as validation errors.
+ */
+function readTelemetryQuery(url) {
+  const values = {};
+  for (const [name, value] of url.searchParams) {
+    if (!TELEMETRY_QUERY_FIELDS.has(name)) {
+      throw new ValidationError(`unknown query parameter ${name}`);
+    }
+    if (Object.hasOwn(values, name)) {
+      throw new ValidationError(`${name} query parameter must appear at most once`);
+    }
+    values[name] = value;
+  }
+  for (const name of TELEMETRY_QUERY_FIELDS) {
+    if (!Object.hasOwn(values, name)) {
+      throw new ValidationError(`${name} query parameter is required`);
+    }
+  }
+  const from = parseTimeParameter("from", values.from);
+  const to = parseTimeParameter("to", values.to);
+  if (from.millis >= to.millis) {
+    throw new ValidationError("from query parameter must be earlier than to");
+  }
+  if (!POSITIVE_INTEGER.test(values.bucket_seconds)) {
+    throw new ValidationError("bucket_seconds query parameter must be an integer between 1 and 86400");
+  }
+  const bucketSeconds = Number(values.bucket_seconds);
+  if (bucketSeconds > 86400) {
+    throw new ValidationError("bucket_seconds query parameter must be an integer between 1 and 86400");
+  }
+  if (!TELEMETRY_AGGREGATES.has(values.aggregate)) {
+    throw new ValidationError("aggregate query parameter must be one of avg, min, max, sum, count");
+  }
+  return {
+    metric: values.metric,
+    from: from.canonical,
+    to: to.canonical,
+    fromMillis: from.millis,
+    toMillis: to.millis,
+    bucketSeconds,
+    aggregate: values.aggregate,
+  };
+}
+
 async function readJson(request) {
   const contentType = (request.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
   if (contentType !== "application/json") {
@@ -160,6 +210,9 @@ async function dispatch(service, request) {
   }
   if (method === "GET" && parts.length === 3 && parts[0] === "devices" && parts[2] === "shadow") {
     return { status: 200, body: service.getShadow(parts[1]) };
+  }
+  if (method === "GET" && parts.length === 3 && parts[0] === "devices" && parts[2] === "telemetry") {
+    return { status: 200, body: service.telemetry(parts[1], readTelemetryQuery(url)) };
   }
   if (method === "POST" && parts.length === 3 && parts[0] === "devices" && parts[2] === "shadow") {
     const body = await readJson(request);
