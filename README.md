@@ -335,8 +335,19 @@ curl -s -X POST http://127.0.0.1:8080/rules \
 
 ### `GET /events`
 
-Returns every event in sequence order. `?rule_id=` and `?device_id=` filter the
-result; any other query parameter is rejected.
+Returns events in ascending `sequence` order. All filters are optional and
+combine as an intersection; any other query parameter is rejected with `400`.
+
+- `rule_id`, `device_id`, `event`, `source` — exact string matches (`event`
+  and `source` must not be empty).
+- `occurred_after`, `occurred_before` — RFC3339 UTC timestamps ending in `Z`;
+  the range is left-closed, right-open on `occurred_at`
+  (`occurred_after <= occurred_at < occurred_before`), and `occurred_after`
+  must be earlier than `occurred_before`.
+- `after_sequence` — a safe non-negative integer; only events with a greater
+  `sequence` are returned, so the last `sequence` of a page continues the
+  next one.
+- `limit` — an integer between 1 and 1000 bounding the page size.
 
 ```json
 {"events":[{"sequence":1,"rule_id":"hot","event":"temperature_high","source":"shadow","device_id":"sensor-1","topic":null,"value":31,"occurred_at":"2024-05-01T10:00:00.000Z"}]}
@@ -361,6 +372,6 @@ result; any other query parameter is rejected.
 node --test tests/
 ```
 
-`node --test` and `node --test "tests/*.test.js"` run the same 43 tests;
+`node --test` and `node --test "tests/*.test.js"` run the same 45 tests;
 `tests/index.js` exists so the directory form also works on Node 22, which does
 not expand a directory argument on its own.

@@ -110,9 +110,80 @@ test("rules turn shadow updates into events", async () => {
     });
     const filtered = await (await fetch(`${started.httpUrl}/events?device_id=device-1&rule_id=hot`)).json();
     assert.equal(filtered.events.length, 1);
-    const unknownQuery = await fetch(`${started.httpUrl}/events?limit=1`);
+    const unknownQuery = await fetch(`${started.httpUrl}/events?cursor=1`);
     assert.equal(unknownQuery.status, 400);
     assert.equal((await unknownQuery.json()).error.code, "validation_error");
+  });
+});
+
+test("events can be filtered by event, source, time range and paged", async () => {
+  await withServer(async (started) => {
+    const append = (sequence) =>
+      started.service.store.appendEvent({
+        rule_id: `rule-${sequence}`,
+        event: sequence % 2 === 0 ? "even_event" : "odd_event",
+        source: sequence % 2 === 0 ? "mqtt" : "shadow",
+        device_id: "device-1",
+        topic: null,
+        value: sequence,
+        occurred_at: `2024-01-0${sequence}T00:00:00.000Z`,
+      });
+    for (let sequence = 1; sequence <= 5; sequence += 1) {
+      append(sequence);
+    }
+    const get = async (query) => {
+      const response = await fetch(`${started.httpUrl}/events${query}`);
+      return { status: response.status, body: await response.json() };
+    };
+    const all = await get("");
+    assert.deepEqual(all.body.events.map((entry) => entry.sequence), [1, 2, 3, 4, 5]);
+    const byEvent = await get("?event=even_event");
+    assert.deepEqual(byEvent.body.events.map((entry) => entry.sequence), [2, 4]);
+    const bySource = await get("?source=shadow");
+    assert.deepEqual(bySource.body.events.map((entry) => entry.sequence), [1, 3, 5]);
+    const intersection = await get("?event=odd_event&source=shadow&device_id=device-1");
+    assert.deepEqual(intersection.body.events.map((entry) => entry.sequence), [1, 3, 5]);
+    // The range is left-closed, right-open on occurred_at.
+    const ranged = await get("?occurred_after=2024-01-02T00:00:00Z&occurred_before=2024-01-04T00:00:00.000Z");
+    assert.deepEqual(ranged.body.events.map((entry) => entry.sequence), [2, 3]);
+    const firstPage = await get("?limit=2");
+    assert.deepEqual(firstPage.body.events.map((entry) => entry.sequence), [1, 2]);
+    const secondPage = await get(`?after_sequence=${firstPage.body.events.at(-1).sequence}&limit=2`);
+    assert.deepEqual(secondPage.body.events.map((entry) => entry.sequence), [3, 4]);
+    const lastPage = await get(`?after_sequence=${secondPage.body.events.at(-1).sequence}&limit=2`);
+    assert.deepEqual(lastPage.body.events.map((entry) => entry.sequence), [5]);
+    const combined = await get("?source=mqtt&occurred_after=2024-01-01T00:00:00.000Z&after_sequence=2&limit=1");
+    assert.deepEqual(combined.body.events.map((entry) => entry.sequence), [4]);
+    const repeat = await get("?limit=2");
+    assert.deepEqual(repeat.body, firstPage.body);
+  });
+});
+
+test("events reject malformed filter parameters", async () => {
+  await withServer(async (started) => {
+    const bad = [
+      "event=",
+      "source=",
+      "occurred_after=2024-01-01T00:00:00",
+      "occurred_after=2024-01-01",
+      "occurred_before=not-a-time",
+      "occurred_after=2024-01-02T00:00:00Z&occurred_before=2024-01-02T00:00:00Z",
+      "occurred_after=2024-01-03T00:00:00Z&occurred_before=2024-01-02T00:00:00Z",
+      "after_sequence=-1",
+      "after_sequence=1.5",
+      "after_sequence=9007199254740993",
+      "limit=0",
+      "limit=1001",
+      "limit=two",
+    ];
+    for (const query of bad) {
+      const response = await fetch(`${started.httpUrl}/events?${query}`);
+      assert.equal(response.status, 400, query);
+      const body = await response.json();
+      assert.equal(body.error.code, "validation_error", query);
+      const parameter = query.split(/[=&]/)[0];
+      assert.ok(body.error.message.includes(parameter), `${query}: ${body.error.message}`);
+    }
   });
 });
 

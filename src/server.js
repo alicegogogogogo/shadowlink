@@ -10,6 +10,12 @@ const MAX_BODY_BYTES = 1000000;
 const QUERY_FIELDS = new Map([
   ["rule_id", "ruleId"],
   ["device_id", "deviceId"],
+  ["event", "event"],
+  ["source", "source"],
+  ["occurred_after", "occurredAfter"],
+  ["occurred_before", "occurredBefore"],
+  ["after_sequence", "afterSequence"],
+  ["limit", "limit"],
 ]);
 
 async function readJson(request) {

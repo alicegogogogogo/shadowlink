@@ -6,6 +6,34 @@ import { Store } from "./store.js";
 import { mergeValues } from "./values.js";
 
 const SHADOW_PREFIX = "$shadow/";
+const RFC3339_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+const UNSIGNED_INTEGER = /^\d+$/;
+
+/**
+ * Timestamps are normalized to the canonical `Date#toISOString` form, which is
+ * how events are persisted, so the store can compare them lexicographically.
+ */
+function parseTimestamp(value, label) {
+  if (typeof value !== "string" || !RFC3339_UTC.test(value)) {
+    throw new ValidationError(`${label} must be an RFC3339 UTC timestamp ending in Z`);
+  }
+  const time = Date.parse(value);
+  if (Number.isNaN(time)) {
+    throw new ValidationError(`${label} must be a valid RFC3339 UTC timestamp`);
+  }
+  return new Date(time).toISOString();
+}
+
+function parseInteger(value, label) {
+  if (typeof value !== "string" || !UNSIGNED_INTEGER.test(value)) {
+    throw new ValidationError(`${label} must be a safe non-negative integer`);
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw new ValidationError(`${label} must be a safe non-negative integer`);
+  }
+  return number;
+}
 
 function byId(left, right) {
   return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
@@ -101,13 +129,54 @@ export class Service {
   }
 
   events(query = {}) {
+    const filters = {
+      ruleId: null,
+      deviceId: null,
+      event: null,
+      source: null,
+      occurredAfter: null,
+      occurredBefore: null,
+      afterSequence: null,
+      limit: null,
+    };
     if (query.ruleId !== undefined && query.ruleId !== null) {
-      identifier(query.ruleId, "rule id");
+      filters.ruleId = identifier(query.ruleId, "rule id");
     }
     if (query.deviceId !== undefined && query.deviceId !== null) {
-      identifier(query.deviceId, "device id");
+      filters.deviceId = identifier(query.deviceId, "device id");
     }
-    return { events: this.store.listEvents({ ruleId: query.ruleId ?? null, deviceId: query.deviceId ?? null }) };
+    if (query.event !== undefined && query.event !== null) {
+      if (query.event === "") {
+        throw new ValidationError("event must not be empty");
+      }
+      filters.event = query.event;
+    }
+    if (query.source !== undefined && query.source !== null) {
+      if (query.source === "") {
+        throw new ValidationError("source must not be empty");
+      }
+      filters.source = query.source;
+    }
+    if (query.occurredAfter !== undefined && query.occurredAfter !== null) {
+      filters.occurredAfter = parseTimestamp(query.occurredAfter, "occurred_after");
+    }
+    if (query.occurredBefore !== undefined && query.occurredBefore !== null) {
+      filters.occurredBefore = parseTimestamp(query.occurredBefore, "occurred_before");
+    }
+    if (filters.occurredAfter !== null && filters.occurredBefore !== null && filters.occurredAfter >= filters.occurredBefore) {
+      throw new ValidationError("occurred_after must be earlier than occurred_before");
+    }
+    if (query.afterSequence !== undefined && query.afterSequence !== null) {
+      filters.afterSequence = parseInteger(query.afterSequence, "after_sequence");
+    }
+    if (query.limit !== undefined && query.limit !== null) {
+      const limit = parseInteger(query.limit, "limit");
+      if (limit < 1 || limit > 1000) {
+        throw new ValidationError("limit must be an integer between 1 and 1000");
+      }
+      filters.limit = limit;
+    }
+    return { events: this.store.listEvents(filters) };
   }
 
   /**

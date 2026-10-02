@@ -130,7 +130,7 @@ export class Store {
     return { sequence: Number(info.lastInsertRowid), ...event };
   }
 
-  listEvents({ ruleId = null, deviceId = null } = {}) {
+  listEvents({ ruleId = null, deviceId = null, event = null, source = null, occurredAfter = null, occurredBefore = null, afterSequence = null, limit = null } = {}) {
     const clauses = [];
     const parameters = [];
     if (ruleId !== null) {
@@ -141,9 +141,34 @@ export class Store {
       clauses.push("device_id = ?");
       parameters.push(deviceId);
     }
+    if (event !== null) {
+      clauses.push("event = ?");
+      parameters.push(event);
+    }
+    if (source !== null) {
+      clauses.push("source = ?");
+      parameters.push(source);
+    }
+    if (occurredAfter !== null) {
+      clauses.push("occurred_at >= ?");
+      parameters.push(occurredAfter);
+    }
+    if (occurredBefore !== null) {
+      clauses.push("occurred_at < ?");
+      parameters.push(occurredBefore);
+    }
+    if (afterSequence !== null) {
+      clauses.push("sequence > ?");
+      parameters.push(afterSequence);
+    }
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    let sql = `SELECT * FROM events${where} ORDER BY sequence`;
+    if (limit !== null) {
+      sql += " LIMIT ?";
+      parameters.push(limit);
+    }
     return this.database
-      .prepare(`SELECT * FROM events${where} ORDER BY sequence`)
+      .prepare(sql)
       .all(...parameters)
       .map((row) => ({
         sequence: row.sequence,
