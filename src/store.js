@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS idempotency (
   operation TEXT NOT NULL,
   response TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telemetry_samples (
+  device_id TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  value REAL NOT NULL,
+  seq INTEGER PRIMARY KEY AUTOINCREMENT
+);
+CREATE INDEX IF NOT EXISTS telemetry_query
+  ON telemetry_samples (device_id, metric, ts);
 `;
 
 export class Store {
@@ -223,5 +232,57 @@ export class Store {
     this.database
       .prepare("INSERT INTO idempotency (key, operation, response) VALUES (?, ?, ?)")
       .run(key, operation, this.encode(response));
+  }
+
+  /** Persist one telemetry sample stamped at the moment it was received. */
+  insertTelemetrySample(deviceId, metric, timestampMs, value) {
+    this.database
+      .prepare("INSERT INTO telemetry_samples (device_id, metric, ts, value) VALUES (?, ?, ?, ?)")
+      .run(deviceId, metric, timestampMs, value);
+  }
+
+  /**
+   * Aggregate the samples of one device/metric inside the half-open window
+   * [fromMs, toMs) into Unix-epoch aligned buckets of `bucketSeconds` width.
+   * Empty buckets are omitted; rows come back in ascending bucket order. The
+   * aggregation function is chosen by the caller from a fixed whitelist.
+   */
+  aggregateTelemetry({ deviceId, metric, fromMs, toMs, bucketSeconds, aggregate }) {
+    const widthMs = bucketSeconds * 1000;
+    let expression;
+    switch (aggregate) {
+      case "avg":
+        expression = "AVG(value)";
+        break;
+      case "min":
+        expression = "MIN(value)";
+        break;
+      case "max":
+        expression = "MAX(value)";
+        break;
+      case "sum":
+        expression = "SUM(value)";
+        break;
+      case "count":
+        expression = "COUNT(*)";
+        break;
+      default:
+        throw new Error(`unsupported telemetry aggregate ${aggregate}`);
+    }
+    return this.database
+      .prepare(
+        // Bucket start is floor(ts / width) * width, aligned to the Unix
+        // epoch, including pre-1970 (negative) timestamps. Bound parameters
+        // arrive as doubles, so `/` would be float division; `%` stays exact
+        // at these magnitudes. The double-mod normalizes SQLite's truncated
+        // remainder into a floored remainder in [0, width) for either sign.
+        `SELECT ts - (((ts % ?) + ?) % ?) AS bucket, ${expression} AS value, COUNT(*) AS count
+         FROM telemetry_samples
+         WHERE device_id = ? AND metric = ? AND ts >= ? AND ts < ?
+         GROUP BY bucket
+         ORDER BY bucket ASC`,
+      )
+      .all(widthMs, widthMs, widthMs, deviceId, metric, fromMs, toMs)
+      .map((row) => ({ startMs: row.bucket, value: row.value, count: row.count }));
   }
 }

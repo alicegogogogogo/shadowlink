@@ -1,11 +1,12 @@
 import { ConflictError, NotFoundError, ValidationError } from "./errors.js";
 import { topicMatches } from "./mqtt.js";
-import { evaluateCondition, identifier, matchedValue, parseRule } from "./rules.js";
+import { evaluateCondition, identifier, isIdentifier, matchedValue, parseRule } from "./rules.js";
 import { computeDelta, parseReportedPatch, parseShadowPatch } from "./shadow.js";
 import { Store } from "./store.js";
 import { mergeValues } from "./values.js";
 
 const SHADOW_PREFIX = "$shadow/";
+const TELEMETRY_PREFIX = "$telemetry/";
 
 function byId(left, right) {
   return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
@@ -37,6 +38,15 @@ export class Service {
 
   health() {
     return { status: "ok" };
+  }
+
+  /**
+   * Receipt time for a sample in epoch milliseconds. Derived from the
+   * injectable `now` clock (which returns canonical ISO-8601 UTC) so telemetry
+   * is stamped by the same clock as shadows and events.
+   */
+  clock() {
+    return Date.parse(this.now());
   }
 
   getShadow(rawDeviceId) {
@@ -122,11 +132,48 @@ export class Service {
   }
 
   /**
+   * Aggregate a device/metric's samples into epoch-aligned buckets over the
+   * half-open window [from, to). A device that never published a sample is a
+   * normal result with empty buckets; it never creates a shadow or an event.
+   */
+  telemetry(rawDeviceId, query) {
+    const deviceId = identifier(rawDeviceId, "device id");
+    const metric = identifier(query.metric, "metric");
+    const rows = this.store.aggregateTelemetry({
+      deviceId,
+      metric,
+      fromMs: query.from.millis,
+      toMs: query.to.millis,
+      bucketSeconds: query.bucketSeconds,
+      aggregate: query.aggregate,
+    });
+    const widthMs = query.bucketSeconds * 1000;
+    return {
+      device_id: deviceId,
+      metric,
+      from: query.from.canonical,
+      to: query.to.canonical,
+      bucket_seconds: query.bucketSeconds,
+      aggregate: query.aggregate,
+      buckets: rows.map((row) => ({
+        start: new Date(row.startMs).toISOString(),
+        end: new Date(row.startMs + widthMs).toISOString(),
+        value: row.value,
+        count: row.count,
+      })),
+    };
+  }
+
+  /**
    * Called by the broker for every routed publication: the reserved shadow
    * topic is applied first, then mqtt-scoped rules are evaluated once for the
-   * published topic.
+   * published topic. A `$telemetry/<deviceId>/<metric>` publication carrying a
+   * single finite JSON number also stores one sample; that capture never
+   * changes routing, rules or events, and an invalid publication is simply not
+   * recorded without raising anything.
    */
   handlePublish(topic, payload) {
+    this.#recordTelemetry(topic, payload);
     if (topic.startsWith(SHADOW_PREFIX)) {
       const parts = topic.split("/");
       if (parts.length === 3 && parts[2] === "update" && parts[1] !== "") {
@@ -150,6 +197,37 @@ export class Service {
         this.#emit(rule, { device_id: null, topic, value: matchedValue(rule, observation) });
       }
     }
+  }
+
+  /**
+   * Store a telemetry sample for a `$telemetry/<deviceId>/<metric>` publication
+   * whose payload is a single finite JSON number. Anything else — wrong topic
+   * shape, illegal device id or metric, a payload that is not a JSON number, or
+   * NaN/Infinity — stores nothing but is still routed and rule evaluated by the
+   * caller as a normal publication.
+   */
+  #recordTelemetry(topic, payload) {
+    if (!topic.startsWith(TELEMETRY_PREFIX)) {
+      return;
+    }
+    const parts = topic.split("/");
+    if (parts.length !== 3 || parts[1] === "" || parts[2] === "") {
+      return;
+    }
+    const [, deviceId, metric] = parts;
+    if (!isIdentifier(deviceId) || !isIdentifier(metric)) {
+      return;
+    }
+    let value;
+    try {
+      value = JSON.parse(payload.toString("utf8"));
+    } catch {
+      return;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return;
+    }
+    this.store.insertTelemetrySample(deviceId, metric, this.clock(), value);
   }
 
   #idempotent(key, operation, action) {

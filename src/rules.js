@@ -15,6 +15,11 @@ export function identifier(value, label) {
   return value;
 }
 
+/** Non-throwing variant of {@link identifier}, for paths that ignore bad input. */
+export function isIdentifier(value) {
+  return typeof value === "string" && IDENTIFIER.test(value);
+}
+
 /**
  * A rule is either shadow-scoped (it watches one device's shadow document) or
  * mqtt-scoped (its topic filter and the decoded payload form the document).

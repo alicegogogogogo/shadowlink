@@ -51,7 +51,7 @@ function parseTimeParameter(name, value) {
   if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== canonical) {
     throw new ValidationError(`${name} query parameter must be an RFC3339 UTC timestamp ending in Z`);
   }
-  return { withoutZ: canonical.slice(0, -1), millis: parsed.getTime() };
+  return { canonical, withoutZ: canonical.slice(0, -1), millis: parsed.getTime() };
 }
 
 function parseSequenceParameter(value) {
@@ -122,6 +122,50 @@ function readQuery(url) {
   };
 }
 
+const TELEMETRY_QUERY_FIELDS = ["metric", "from", "to", "bucket_seconds", "aggregate"];
+const AGGREGATES = new Set(["avg", "min", "max", "sum", "count"]);
+
+/**
+ * Parse the telemetry query. Exactly metric, from, to, bucket_seconds and
+ * aggregate must be present, each at most once.
+ */
+function readTelemetryQuery(url) {
+  const values = {};
+  for (const [name, value] of url.searchParams) {
+    if (!TELEMETRY_QUERY_FIELDS.includes(name)) {
+      throw new ValidationError(`unknown query parameter ${name}`);
+    }
+    if (Object.hasOwn(values, name)) {
+      throw new ValidationError(`${name} query parameter must appear at most once`);
+    }
+    values[name] = value;
+  }
+  for (const name of TELEMETRY_QUERY_FIELDS) {
+    if (!Object.hasOwn(values, name)) {
+      throw new ValidationError(`${name} query parameter is required`);
+    }
+    if (values[name] === "") {
+      throw new ValidationError(`${name} query parameter must not be empty`);
+    }
+  }
+  const from = parseTimeParameter("from", values.from);
+  const to = parseTimeParameter("to", values.to);
+  if (from.millis >= to.millis) {
+    throw new ValidationError("from query parameter must be earlier than to");
+  }
+  if (!POSITIVE_INTEGER.test(values.bucket_seconds)) {
+    throw new ValidationError("bucket_seconds query parameter must be an integer between 1 and 86400");
+  }
+  const bucketSeconds = Number(values.bucket_seconds);
+  if (bucketSeconds > 86400) {
+    throw new ValidationError("bucket_seconds query parameter must be an integer between 1 and 86400");
+  }
+  if (!AGGREGATES.has(values.aggregate)) {
+    throw new ValidationError("aggregate query parameter must be one of avg, min, max, sum, count");
+  }
+  return { metric: values.metric, from, to, bucketSeconds, aggregate: values.aggregate };
+}
+
 async function readJson(request) {
   const contentType = (request.headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
   if (contentType !== "application/json") {
@@ -160,6 +204,9 @@ async function dispatch(service, request) {
   }
   if (method === "GET" && parts.length === 3 && parts[0] === "devices" && parts[2] === "shadow") {
     return { status: 200, body: service.getShadow(parts[1]) };
+  }
+  if (method === "GET" && parts.length === 3 && parts[0] === "devices" && parts[2] === "telemetry") {
+    return { status: 200, body: service.telemetry(parts[1], readTelemetryQuery(url)) };
   }
   if (method === "POST" && parts.length === 3 && parts[0] === "devices" && parts[2] === "shadow") {
     const body = await readJson(request);

@@ -175,6 +175,54 @@ The broker itself publishes on two topics under `$shadow/`:
   whose device id is not a valid identifier, is routed but ignored.
 - `$shadow/<deviceId>/delta` — after an accepted write whose `delta` is not
   empty, the broker publishes the delta as JSON at QoS 0 with `RETAIN` clear.
+- `$telemetry/<deviceId>/<metric>` — a client `PUBLISH` whose UTF-8 payload is a
+  single JSON number stores one telemetry sample for that device and metric,
+  stamped at receipt time. The publication is routed to subscribers and run
+  through the `mqtt` rules exactly like any other publication, but telemetry
+  itself never writes an event. A topic that is not exactly the three reserved
+  segments, an illegal device id or metric, a payload that is not a JSON
+  number, or a `NaN`/`Infinity` value stores nothing: the message is still a
+  normal publication and raises no protocol error. QoS 0 and QoS 1 keep their
+  usual delivery semantics, so a retransmitted QoS 1 packet (same packet id on
+  one connection) is acknowledged again but records only the first sample.
+
+## Telemetry
+
+Samples are numeric observations grouped by a device and a metric. Both
+identifiers follow the usual rule
+(`[A-Za-z0-9][A-Za-z0-9._:-]*`, 1 to 100 characters). Samples persist in
+SQLite and survive restarts; querying a device that never reported a sample
+creates neither a shadow nor an event.
+
+### `GET /devices/{deviceId}/telemetry`
+
+Aggregates a device/metric's samples into fixed-width buckets. All five query
+parameters are required, may appear at most once, and no other parameter is
+accepted:
+
+- `metric` — the metric identifier;
+- `from` and `to` — RFC3339 UTC timestamps ending in `Z`, selecting the
+  half-open range `ts >= from` and `ts < to`, with `from` strictly earlier than
+  `to`;
+- `bucket_seconds` — an integer between `1` and `86400`;
+- `aggregate` — one of `avg`, `min`, `max`, `sum`, `count`.
+
+Buckets are aligned to the Unix epoch (`start = floor(ts / width) * width`) and
+returned in ascending order; only non-empty buckets are returned, so a window
+without samples yields `"buckets": []`. Every timestamp in the response is
+RFC3339 UTC ending in `Z`; `end` is the (exclusive) bucket boundary, `value` is
+the aggregate and `count` is the number of samples in the bucket.
+
+```bash
+curl -s 'http://127.0.0.1:8080/devices/sensor-1/telemetry?metric=temperature&from=2024-05-01T10:00:00Z&to=2024-05-01T11:00:00Z&bucket_seconds=600&aggregate=avg'
+```
+```json
+{"device_id":"sensor-1","metric":"temperature","from":"2024-05-01T10:00:00.000Z","to":"2024-05-01T11:00:00.000Z","bucket_seconds":600,"aggregate":"avg","buckets":[{"start":"2024-05-01T10:00:00.000Z","end":"2024-05-01T10:10:00.000Z","value":21.5,"count":4}]}
+```
+
+A missing, duplicated or unknown parameter, an illegal `device_id` or `metric`,
+a malformed timestamp, `from` at or after `to`, or an out-of-range
+`bucket_seconds`/`aggregate` is rejected with `400 validation_error`.
 
 ## Device shadows
 
@@ -380,6 +428,6 @@ and repeating a query against an unchanged event set returns the same events.
 node --test tests/
 ```
 
-`node --test` and `node --test "tests/*.test.js"` run the same 43 tests;
+`node --test` and `node --test "tests/*.test.js"` run the same 100 tests;
 `tests/index.js` exists so the directory form also works on Node 22, which does
 not expand a directory argument on its own.
