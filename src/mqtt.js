@@ -195,9 +195,6 @@ export function decodeConnect(body) {
   if (willQos > 1) {
     throw new ProtocolError("will qos 2 is not supported");
   }
-  if (!cleanSession) {
-    throw new ProtocolError("clean session must be 1; persistent sessions are not supported");
-  }
   const client = readString(body, offset, "client identifier");
   offset = client.offset;
   if (client.value.length === 0 || Buffer.byteLength(client.value, "utf8") > MAX_CLIENT_ID_BYTES) {

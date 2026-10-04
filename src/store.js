@@ -47,6 +47,25 @@ CREATE TABLE IF NOT EXISTS telemetry_samples (
 );
 CREATE INDEX IF NOT EXISTS telemetry_query
   ON telemetry_samples (device_id, metric, ts);
+CREATE TABLE IF NOT EXISTS sessions (
+  client_id TEXT PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS session_subscriptions (
+  client_id TEXT NOT NULL,
+  topic_filter TEXT NOT NULL,
+  qos INTEGER NOT NULL,
+  PRIMARY KEY (client_id, topic_filter)
+);
+CREATE TABLE IF NOT EXISTS session_queue (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  retain INTEGER NOT NULL,
+  packet_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS session_queue_client
+  ON session_queue (client_id, seq);
 `;
 
 export class Store {
@@ -232,6 +251,71 @@ export class Store {
     this.database
       .prepare("INSERT INTO idempotency (key, operation, response) VALUES (?, ?, ?)")
       .run(key, operation, this.encode(response));
+  }
+
+  /**
+   * Load every persistent session with its subscriptions and its queued
+   * messages. Queue rows come back in insertion (publication) order; a null
+   * packetId marks a message that was never sent, a non-null one a message
+   * that was sent but never acknowledged.
+   */
+  listSessions() {
+    const subscriptions = this.database.prepare("SELECT client_id, topic_filter, qos FROM session_subscriptions").all();
+    const queued = this.database.prepare("SELECT seq, client_id, topic, payload, retain, packet_id FROM session_queue ORDER BY seq").all();
+    return this.database
+      .prepare("SELECT client_id FROM sessions ORDER BY client_id")
+      .all()
+      .map((row) => ({
+        clientId: row.client_id,
+        subscriptions: subscriptions
+          .filter((entry) => entry.client_id === row.client_id)
+          .map((entry) => ({ filter: entry.topic_filter, qos: entry.qos })),
+        queue: queued
+          .filter((entry) => entry.client_id === row.client_id)
+          .map((entry) => ({
+            seq: entry.seq,
+            topic: entry.topic,
+            payload: Buffer.from(entry.payload, "base64"),
+            retain: entry.retain === 1,
+            packetId: entry.packet_id,
+          })),
+      }));
+  }
+
+  createSession(clientId) {
+    this.database.prepare("INSERT INTO sessions (client_id) VALUES (?)").run(clientId);
+  }
+
+  deleteSession(clientId) {
+    this.database.prepare("DELETE FROM sessions WHERE client_id = ?").run(clientId);
+    this.database.prepare("DELETE FROM session_subscriptions WHERE client_id = ?").run(clientId);
+    this.database.prepare("DELETE FROM session_queue WHERE client_id = ?").run(clientId);
+  }
+
+  putSessionSubscription(clientId, filter, qos) {
+    this.database
+      .prepare(
+        `INSERT INTO session_subscriptions (client_id, topic_filter, qos) VALUES (?, ?, ?)
+         ON CONFLICT(client_id, topic_filter) DO UPDATE SET qos = excluded.qos`,
+      )
+      .run(clientId, filter, qos);
+  }
+
+  /** Append one queued message; returns its sequence, which orders the queue. */
+  appendSessionMessage(clientId, topic, payload, retain, packetId) {
+    const info = this.database
+      .prepare("INSERT INTO session_queue (client_id, topic, payload, retain, packet_id) VALUES (?, ?, ?, ?, ?)")
+      .run(clientId, topic, payload.toString("base64"), retain ? 1 : 0, packetId);
+    return Number(info.lastInsertRowid);
+  }
+
+  /** Record the packet identifier a queued message was sent with. */
+  markSessionMessageSent(seq, packetId) {
+    this.database.prepare("UPDATE session_queue SET packet_id = ? WHERE seq = ?").run(packetId, seq);
+  }
+
+  deleteSessionMessage(seq) {
+    this.database.prepare("DELETE FROM session_queue WHERE seq = ?").run(seq);
   }
 
   /** Persist one telemetry sample stamped at the moment it was received. */

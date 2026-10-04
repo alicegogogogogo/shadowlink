@@ -20,6 +20,7 @@ class ClientConnection {
     this.socket = socket;
     this.buffer = Buffer.alloc(0);
     this.id = null;
+    this.session = null;
     this.subscriptions = new Map();
     this.inboundPacketIds = new Set();
     this.pendingPacketIds = new Set();
@@ -96,8 +97,50 @@ class ClientConnection {
     this.id = connect.clientId;
     this.keepAlive = connect.keepAlive;
     this.will = connect.will;
-    this.send(mqtt.encodeConnack(false, mqtt.RETURN_CODE.ACCEPTED));
+    let sessionPresent = false;
+    if (connect.cleanSession) {
+      // A clean connect discards any persistent session stored for this id.
+      this.broker.discardSession(connect.clientId);
+    } else {
+      const { session, existed } = this.broker.resumeSession(connect.clientId);
+      this.session = session;
+      sessionPresent = existed;
+      this.subscriptions = session.subscriptions;
+      for (const entry of session.queue) {
+        if (entry.packetId !== null) {
+          this.pendingPacketIds.add(entry.packetId);
+        }
+      }
+    }
+    this.send(mqtt.encodeConnack(sessionPresent, mqtt.RETURN_CODE.ACCEPTED));
     this.#touch();
+    if (this.session !== null) {
+      this.#flushSessionQueue();
+    }
+  }
+
+  /**
+   * Catch a resumed persistent session up: first retransmit the messages that
+   * were sent but never acknowledged, in their original send order, keeping
+   * the original packet id and setting DUP; then deliver the messages that
+   * were queued while the client was offline, in queue order, with freshly
+   * allocated packet ids and DUP clear.
+   */
+  #flushSessionQueue() {
+    for (const entry of this.session.queue) {
+      if (entry.packetId !== null) {
+        this.send(mqtt.encodePublish({ topic: entry.topic, payload: entry.payload, qos: 1, packetId: entry.packetId, retain: entry.retain, dup: true }));
+      }
+    }
+    for (const entry of this.session.queue) {
+      if (entry.packetId === null) {
+        const packetId = this.#takePacketId();
+        entry.packetId = packetId;
+        this.pendingPacketIds.add(packetId);
+        this.broker.store.markSessionMessageSent(entry.seq, packetId);
+        this.send(mqtt.encodePublish({ topic: entry.topic, payload: entry.payload, qos: 1, packetId, retain: entry.retain, dup: false }));
+      }
+    }
   }
 
   #publish(flags, body) {
@@ -118,15 +161,27 @@ class ClientConnection {
     if (body.length !== 2) {
       throw new ProtocolError("puback must contain exactly a packet identifier");
     }
-    this.pendingPacketIds.delete(body.readUInt16BE(0));
+    const packetId = body.readUInt16BE(0);
+    this.pendingPacketIds.delete(packetId);
+    if (this.session !== null) {
+      const index = this.session.queue.findIndex((entry) => entry.packetId === packetId);
+      if (index !== -1) {
+        const [entry] = this.session.queue.splice(index, 1);
+        this.broker.store.deleteSessionMessage(entry.seq);
+      }
+    }
   }
 
   #subscribe(body) {
     const subscribe = mqtt.decodeSubscribe(body);
     const returnCodes = [];
     for (const subscription of subscribe.subscriptions) {
-      this.subscriptions.set(subscription.filter, Math.min(subscription.qos, 1));
-      returnCodes.push(Math.min(subscription.qos, 1));
+      const granted = Math.min(subscription.qos, 1);
+      this.subscriptions.set(subscription.filter, granted);
+      if (this.session !== null) {
+        this.broker.store.putSessionSubscription(this.id, subscription.filter, granted);
+      }
+      returnCodes.push(granted);
     }
     this.send(mqtt.encodeSuback(subscribe.packetId, returnCodes));
     const delivered = new Set();
@@ -170,6 +225,12 @@ class ClientConnection {
     }
     const packetId = this.#takePacketId();
     this.pendingPacketIds.add(packetId);
+    if (this.session !== null) {
+      // A persistent session remembers every unacknowledged QoS 1 delivery so
+      // it can be retransmitted after a reconnect or a broker restart.
+      const seq = this.broker.store.appendSessionMessage(this.id, topic, payload, retain, packetId);
+      this.session.queue.push({ seq, topic, payload: Buffer.from(payload), retain, packetId });
+    }
     this.send(mqtt.encodePublish({ topic, payload, qos: 1, packetId, retain }));
   }
 
@@ -239,6 +300,17 @@ export class Broker {
     this.port = options.port ?? 1883;
     this.maxPacketBytes = options.maxPacketBytes ?? DEFAULT_MAX_PACKET_BYTES;
     this.connections = new Set();
+    // Persistent sessions survive disconnects and restarts: each holds the
+    // subscriptions granted to the client and the queue of QoS 1 messages
+    // that are unacknowledged or were never sent.
+    this.sessions = new Map();
+    for (const stored of this.store.listSessions()) {
+      this.sessions.set(stored.clientId, {
+        clientId: stored.clientId,
+        subscriptions: new Map(stored.subscriptions.map((subscription) => [subscription.filter, subscription.qos])),
+        queue: stored.queue,
+      });
+    }
     this.server = net.createServer((socket) => {
       this.connections.add(new ClientConnection(this, socket));
     });
@@ -262,12 +334,35 @@ export class Broker {
   }
 
   hasClient(clientId) {
+    return this.#connectionFor(clientId) !== null;
+  }
+
+  #connectionFor(clientId) {
     for (const connection of this.connections) {
       if (connection.id === clientId) {
-        return true;
+        return connection;
       }
     }
-    return false;
+    return null;
+  }
+
+  /** Drop the persistent session of a client that connects clean. */
+  discardSession(clientId) {
+    if (this.sessions.delete(clientId)) {
+      this.store.deleteSession(clientId);
+    }
+  }
+
+  /** Resume the persistent session for clientId, creating it on first use. */
+  resumeSession(clientId) {
+    const existing = this.sessions.get(clientId);
+    if (existing !== undefined) {
+      return { session: existing, existed: true };
+    }
+    const session = { clientId, subscriptions: new Map(), queue: [] };
+    this.store.createSession(clientId);
+    this.sessions.set(clientId, session);
+    return { session, existed: false };
   }
 
   unregister(connection) {
@@ -279,9 +374,10 @@ export class Broker {
   }
 
   /**
-   * Route one publication: retain it, fan it out to matching subscriptions and
-   * then let the service evaluate mqtt rules. An empty retained payload clears
-   * the retained message for that topic.
+   * Route one publication: retain it, fan it out to matching subscriptions,
+   * queue it for offline persistent sessions and then let the service
+   * evaluate mqtt rules. An empty retained payload clears the retained
+   * message for that topic.
    */
   publish(topic, payload, options = {}) {
     const { qos = 0, retain = false } = options;
@@ -297,6 +393,34 @@ export class Broker {
     for (const connection of this.connections) {
       connection.deliver(topic, body, qos);
     }
+    this.#enqueueOffline(topic, body, qos);
     this.service.handlePublish(topic, body);
+  }
+
+  /**
+   * Queue the publication for every persistent session whose client is
+   * offline and whose saved subscriptions match. Matching merges to one copy
+   * per client at the highest granted QoS; only a publication whose final
+   * delivery QoS is 1 is queued — a QoS 0 delivery is dropped while the
+   * client is away. Queued messages are unaffected by later changes to the
+   * session's subscriptions.
+   */
+  #enqueueOffline(topic, body, qos) {
+    for (const [clientId, session] of this.sessions) {
+      if (this.#connectionFor(clientId) !== null) {
+        continue;
+      }
+      let granted = null;
+      for (const [filter, filterQos] of session.subscriptions) {
+        if (mqtt.topicMatches(filter, topic)) {
+          granted = granted === null ? filterQos : Math.max(granted, filterQos);
+        }
+      }
+      if (granted === null || Math.min(qos, granted) === 0) {
+        continue;
+      }
+      const seq = this.store.appendSessionMessage(clientId, topic, body, false, null);
+      session.queue.push({ seq, topic, payload: Buffer.from(body), retain: false, packetId: null });
+    }
   }
 }

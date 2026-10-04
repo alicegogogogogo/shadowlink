@@ -65,7 +65,14 @@ export class MqttClient {
       socket.once("error", reject);
     });
     const client = new MqttClient(socket);
-    client.write(connectPacket({ clientId: options.clientId ?? "client", keepAlive: options.keepAlive ?? 0, will: options.will ?? null }));
+    client.write(
+      connectPacket({
+        clientId: options.clientId ?? "client",
+        keepAlive: options.keepAlive ?? 0,
+        will: options.will ?? null,
+        cleanSession: options.cleanSession ?? true,
+      }),
+    );
     return client;
   }
 

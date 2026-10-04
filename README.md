@@ -42,7 +42,7 @@ Shadowlink MQTT broker listening on mqtt://127.0.0.1:8081
 | Packet | Value | Direction | Fixed header flags | Variables |
 | --- | --- | --- | --- | --- |
 | `CONNECT` | 1 | client → broker | `0` | protocol name `MQTT`, level `4`, flags, keep alive, client id, optional will |
-| `CONNACK` | 2 | broker → client | `0` | session present (`0`), return code |
+| `CONNACK` | 2 | broker → client | `0` | session present (`0` or `1`), return code |
 | `PUBLISH` | 3 | both | `DUP<<3 \| QoS<<1 \| RETAIN` | topic name, packet id when QoS > 0, payload |
 | `PUBACK` | 4 | both | `0` | packet id |
 | `SUBSCRIBE` | 8 | client → broker | `2` | packet id, then (topic filter, requested QoS) pairs |
@@ -53,8 +53,8 @@ Shadowlink MQTT broker listening on mqtt://127.0.0.1:8081
 
 Any other packet type, any wrong fixed header flag, or a first packet that is
 not `CONNECT` is a protocol error: the broker closes the connection without a
-reply. `UNSUBSCRIBE`, QoS 2, persistent sessions, username/password (return
-code `4`) and `will` QoS 2 are not supported.
+reply. `UNSUBSCRIBE`, QoS 2, username/password (return code `4`) and `will`
+QoS 2 are not supported.
 
 ### Remaining Length
 
@@ -80,13 +80,37 @@ is a protocol error.
 
 The connect flags byte carries, from bit 7 down: username, password, will
 retain, will QoS (2 bits), will flag, clean session, reserved. In this subset
-username and password must be absent, the reserved bit must be zero, the will
-QoS must be `0` or `1`, and clean session must be `1`. The client identifier
-must be 1 to 128 UTF-8 bytes and must not already be connected: a second
-connection that reuses a live identifier is refused with return code `2` and
-the existing connection keeps running. `CONNACK` always reports session
-present `0`. Return codes are `0` accepted, `1` unacceptable protocol version,
-`2` identifier rejected, `3` server unavailable, `4` bad username/password.
+username and password must be absent, the reserved bit must be zero, and the
+will QoS must be `0` or `1`. The client identifier must be 1 to 128 UTF-8
+bytes and must not already be connected: a second connection that reuses a
+live identifier is refused with return code `2` and the existing connection
+keeps running. Return codes are `0` accepted, `1` unacceptable protocol
+version, `2` identifier rejected, `3` server unavailable, `4` bad
+username/password.
+
+With clean session `1` the connection uses a throwaway session: any
+persistent session stored for that client identifier is discarded, `CONNACK`
+reports session present `0`, and subscriptions and in-flight deliveries vanish
+when the connection ends. With clean session `0` the broker creates a
+persistent session for the client identifier — or resumes the existing one —
+and the session survives network drops, graceful `DISCONNECT` and broker
+restarts. `CONNACK` reports session present `0` when the session is created
+and `1` when an existing persistent session is resumed.
+
+A persistent session stores its subscriptions when the `SUBSCRIBE` succeeds;
+re-subscribing a filter overwrites the stored granted QoS. A resumed session
+needs no new `SUBSCRIBE`, and resuming alone never replays retained messages.
+While the client is offline, a publication that matches the saved
+subscriptions is queued only when its final delivery QoS is `1`
+(`min(published QoS, highest granted QoS)`); a final QoS of `0` is dropped.
+Matching filters still merge to one queued copy per client, the queue keeps
+publication order, and already queued messages are unaffected by later
+subscription changes. After `CONNACK` the broker first retransmits the
+messages it sent but never got a `PUBACK` for — in their original send order,
+with the original packet id and `DUP` set — and then sends the never-sent
+queued messages in queue order with freshly allocated non-zero packet ids and
+`DUP` clear. Each `PUBACK` removes only the matching pending message, so an
+acknowledged message never reappears on a later resume.
 
 A `CONNECT` that fails for one of those reasons is answered with the matching
 return code and then closed; every other malformed packet closes the connection
@@ -155,8 +179,9 @@ Inbound QoS 1 publications are acknowledged with `PUBACK` after routing. A
 packet id that was already acknowledged on the same connection is acknowledged
 again but **not routed twice**, whether or not `DUP` is set, which makes client
 retransmissions idempotent. Outbound QoS 1 publications get a per-connection
-packet id starting at 1 that skips ids still awaiting `PUBACK`; this broker
-does not retransmit them itself.
+packet id starting at 1 that skips ids still awaiting `PUBACK`. Clean-session
+deliveries are never retransmitted; persistent sessions retransmit their
+unacknowledged deliveries on resume as described above.
 
 A `PUBLISH` with `RETAIN` and a non-empty payload replaces the retained message
 for its topic; an empty payload with `RETAIN` clears it. Retained messages are
@@ -428,6 +453,6 @@ and repeating a query against an unchanged event set returns the same events.
 node --test tests/
 ```
 
-`node --test` and `node --test "tests/*.test.js"` run the same 100 tests;
+`node --test` and `node --test "tests/*.test.js"` run the same 112 tests;
 `tests/index.js` exists so the directory form also works on Node 22, which does
 not expand a directory argument on its own.
