@@ -33,6 +33,25 @@ CREATE TABLE IF NOT EXISTS retained (
   payload TEXT NOT NULL,
   qos INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mqtt_sessions (
+  client_id TEXT PRIMARY KEY,
+  next_packet_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mqtt_subscriptions (
+  client_id TEXT NOT NULL,
+  filter TEXT NOT NULL,
+  qos INTEGER NOT NULL,
+  PRIMARY KEY (client_id, filter)
+);
+CREATE TABLE IF NOT EXISTS mqtt_outbound (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_id TEXT NOT NULL,
+  packet_id INTEGER,
+  topic TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  qos INTEGER NOT NULL,
+  retain INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS idempotency (
   key TEXT PRIMARY KEY,
   operation TEXT NOT NULL,
@@ -47,6 +66,8 @@ CREATE TABLE IF NOT EXISTS telemetry_samples (
 );
 CREATE INDEX IF NOT EXISTS telemetry_query
   ON telemetry_samples (device_id, metric, ts);
+CREATE INDEX IF NOT EXISTS mqtt_outbound_query
+  ON mqtt_outbound (client_id, seq);
 `;
 
 export class Store {
@@ -221,6 +242,84 @@ export class Store {
       .prepare("SELECT topic, payload, qos FROM retained ORDER BY topic")
       .all()
       .map((row) => ({ topic: row.topic, payload: Buffer.from(row.payload, "base64"), qos: row.qos }));
+  }
+
+  hasMqttSession(clientId) {
+    return this.database.prepare("SELECT 1 FROM mqtt_sessions WHERE client_id = ?").get(clientId) !== undefined;
+  }
+
+  listMqttSessionIds() {
+    return this.database
+      .prepare("SELECT client_id FROM mqtt_sessions")
+      .all()
+      .map((row) => row.client_id);
+  }
+
+  createMqttSession(clientId) {
+    this.database.prepare("INSERT INTO mqtt_sessions (client_id, next_packet_id) VALUES (?, 1)").run(clientId);
+  }
+
+  deleteMqttSession(clientId) {
+    const tables = ["mqtt_outbound", "mqtt_subscriptions", "mqtt_sessions"];
+    this.transaction(() => {
+      for (const table of tables) {
+        this.database.prepare(`DELETE FROM ${table} WHERE client_id = ?`).run(clientId);
+      }
+    });
+  }
+
+  getMqttNextPacketId(clientId) {
+    const row = this.database.prepare("SELECT next_packet_id FROM mqtt_sessions WHERE client_id = ?").get(clientId);
+    return row.next_packet_id;
+  }
+
+  setMqttNextPacketId(clientId, packetId) {
+    this.database.prepare("UPDATE mqtt_sessions SET next_packet_id = ? WHERE client_id = ?").run(packetId, clientId);
+  }
+
+  listMqttSubscriptions(clientId) {
+    return this.database
+      .prepare("SELECT filter, qos FROM mqtt_subscriptions WHERE client_id = ?")
+      .all(clientId)
+      .map((row) => ({ filter: row.filter, qos: row.qos }));
+  }
+
+  putMqttSubscription(clientId, filter, qos) {
+    this.database
+      .prepare(
+        `INSERT INTO mqtt_subscriptions (client_id, filter, qos) VALUES (?, ?, ?)
+         ON CONFLICT(client_id, filter) DO UPDATE SET qos = excluded.qos`,
+      )
+      .run(clientId, filter, qos);
+  }
+
+  listMqttOutbound(clientId) {
+    return this.database
+      .prepare("SELECT seq, packet_id, topic, payload, qos, retain FROM mqtt_outbound WHERE client_id = ? ORDER BY seq")
+      .all(clientId)
+      .map((row) => ({
+        seq: Number(row.seq),
+        packetId: row.packet_id,
+        topic: row.topic,
+        payload: Buffer.from(row.payload, "base64"),
+        qos: row.qos,
+        retain: row.retain === 1,
+      }));
+  }
+
+  insertMqttOutbound(clientId, { packetId, topic, payload, qos, retain }) {
+    const info = this.database
+      .prepare("INSERT INTO mqtt_outbound (client_id, packet_id, topic, payload, qos, retain) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(clientId, packetId, topic, payload.toString("base64"), qos, retain ? 1 : 0);
+    return Number(info.lastInsertRowid);
+  }
+
+  setMqttOutboundPacketId(seq, packetId) {
+    this.database.prepare("UPDATE mqtt_outbound SET packet_id = ? WHERE seq = ?").run(packetId, seq);
+  }
+
+  deleteMqttOutbound(clientId, packetId) {
+    this.database.prepare("DELETE FROM mqtt_outbound WHERE client_id = ? AND packet_id = ?").run(clientId, packetId);
   }
 
   getIdempotency(key) {

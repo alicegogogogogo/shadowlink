@@ -14,16 +14,179 @@ const FIXED_FLAGS = new Map([
   [mqtt.PACKET.DISCONNECT, 0],
 ]);
 
+/**
+ * Holds one client's subscription set and outbound QoS 1 state. A persistent
+ * session (clean session = 0) is keyed by client id, survives the connection
+ * that created it and mirrors every state change into the store, so it also
+ * survives a broker restart. A clean session is purely in memory and is removed
+ * as soon as its connection detaches.
+ */
+class Session {
+  constructor(broker, id, persistent) {
+    this.broker = broker;
+    this.store = broker.store;
+    this.id = id;
+    this.persistent = persistent;
+    this.connection = null;
+    this.subscriptions = new Map();
+    this.pendingPacketIds = new Set();
+    this.nextPacketId = 1;
+    if (persistent) {
+      this.#load();
+    }
+  }
+
+  #load() {
+    this.subscriptions = new Map(this.store.listMqttSubscriptions(this.id).map((row) => [row.filter, row.qos]));
+    this.pendingPacketIds = new Set();
+    for (const row of this.store.listMqttOutbound(this.id)) {
+      if (row.packetId !== null) {
+        this.pendingPacketIds.add(row.packetId);
+      }
+    }
+    this.nextPacketId = this.store.getMqttNextPacketId(this.id);
+  }
+
+  /** Bind a (re)connecting socket and refresh state that changed while offline. */
+  attach(connection) {
+    this.connection = connection;
+    if (this.persistent) {
+      this.#load();
+    }
+  }
+
+  detach(connection) {
+    if (this.connection === connection) {
+      this.connection = null;
+    }
+    if (!this.persistent) {
+      this.broker.sessions.delete(this.id);
+    }
+  }
+
+  setSubscription(filter, qos) {
+    this.subscriptions.set(filter, qos);
+    if (this.persistent) {
+      this.store.putMqttSubscription(this.id, filter, qos);
+    }
+  }
+
+  /** Highest QoS granted across every matching filter, or null when none match. */
+  #grantedQos(topic) {
+    let granted = null;
+    for (const [filter, filterQos] of this.subscriptions) {
+      if (mqtt.topicMatches(filter, topic)) {
+        granted = granted === null ? filterQos : Math.max(granted, filterQos);
+      }
+    }
+    return granted;
+  }
+
+  /**
+   * Route one normal publication at this session. At most one copy is sent, at
+   * the highest QoS granted by the matching filters. While online the message
+   * is delivered immediately; while offline only an effective QoS 1 message is
+   * queued (effective QoS 0 is discarded).
+   */
+  deliver(topic, payload, qos, retain = false) {
+    const granted = this.#grantedQos(topic);
+    if (granted === null) {
+      return;
+    }
+    const effectiveQos = Math.min(qos, granted);
+    if (this.connection === null) {
+      if (effectiveQos === 1) {
+        this.#enqueue(topic, payload, 1);
+      }
+      return;
+    }
+    this.#sendTo(topic, payload, effectiveQos, retain);
+  }
+
+  /** Deliver a message whose matching was already decided (a retained replay). */
+  sendTo(topic, payload, qos, retain) {
+    this.#sendTo(topic, payload, qos, retain);
+  }
+
+  #enqueue(topic, payload, qos) {
+    if (this.persistent) {
+      // Queued messages are published normally on delivery, so the retain flag
+      // is never carried into the session store (MQTT 3.1.1 section 3.3.1.3).
+      this.store.insertMqttOutbound(this.id, { packetId: null, topic, payload, qos, retain: false });
+    }
+  }
+
+  #sendTo(topic, payload, qos, retain) {
+    if (qos === 0) {
+      this.connection.send(mqtt.encodePublish({ topic, payload, qos: 0, retain }));
+      return;
+    }
+    const packetId = this.#takePacketId();
+    if (this.persistent) {
+      // A redelivery after a reconnect is never a retained replay, so the
+      // stored in-flight copy always has retain clear even though the live
+      // (possibly retained) delivery below keeps its real flag.
+      this.store.insertMqttOutbound(this.id, { packetId, topic, payload, qos: 1, retain: false });
+    }
+    this.connection.send(mqtt.encodePublish({ topic, payload, qos: 1, packetId, retain }));
+  }
+
+  #takePacketId() {
+    for (let attempt = 0; attempt < 65535; attempt += 1) {
+      const candidate = this.nextPacketId;
+      this.nextPacketId = candidate === 65535 ? 1 : candidate + 1;
+      if (!this.pendingPacketIds.has(candidate)) {
+        this.pendingPacketIds.add(candidate);
+        if (this.persistent) {
+          this.store.setMqttNextPacketId(this.id, this.nextPacketId);
+        }
+        return candidate;
+      }
+    }
+    throw new ProtocolError("no packet identifier is available for this session");
+  }
+
+  /** A PUBACK removes just the one in-flight message it identifies. */
+  acknowledge(packetId) {
+    this.pendingPacketIds.delete(packetId);
+    if (this.persistent) {
+      this.store.deleteMqttOutbound(this.id, packetId);
+    }
+  }
+
+  /**
+   * Resend after a reconnect: in-flight messages first, still carrying their
+   * original packet ids with DUP set, then never-sent queued messages in
+   * enqueue order with fresh packet ids and DUP clear.
+   */
+  replay() {
+    if (!this.persistent || this.connection === null) {
+      return;
+    }
+    const rows = this.store.listMqttOutbound(this.id);
+    for (const row of rows.filter((entry) => entry.packetId !== null)) {
+      this.connection.send(
+        mqtt.encodePublish({ topic: row.topic, payload: row.payload, qos: 1, packetId: row.packetId, retain: row.retain, dup: true }),
+      );
+    }
+    for (const row of rows.filter((entry) => entry.packetId === null)) {
+      const packetId = this.#takePacketId();
+      this.store.setMqttOutboundPacketId(row.seq, packetId);
+      this.connection.send(
+        mqtt.encodePublish({ topic: row.topic, payload: row.payload, qos: 1, packetId, retain: row.retain, dup: false }),
+      );
+    }
+  }
+}
+
 class ClientConnection {
   constructor(broker, socket) {
     this.broker = broker;
     this.socket = socket;
     this.buffer = Buffer.alloc(0);
     this.id = null;
-    this.subscriptions = new Map();
+    this.session = null;
     this.inboundPacketIds = new Set();
-    this.pendingPacketIds = new Set();
-    this.nextPacketId = 1;
     this.keepAlive = 0;
     this.timer = null;
     this.will = null;
@@ -96,8 +259,26 @@ class ClientConnection {
     this.id = connect.clientId;
     this.keepAlive = connect.keepAlive;
     this.will = connect.will;
-    this.send(mqtt.encodeConnack(false, mqtt.RETURN_CODE.ACCEPTED));
+    let sessionPresent = false;
+    if (connect.cleanSession) {
+      // A clean start discards any stored session for this identifier.
+      this.broker.discardSession(this.id);
+      this.session = this.broker.createSession(this.id, false);
+    } else {
+      const existing = this.broker.sessions.get(this.id);
+      if (existing !== undefined) {
+        this.session = existing;
+        sessionPresent = true;
+      } else {
+        this.session = this.broker.createSession(this.id, true);
+      }
+    }
+    this.session.attach(this);
+    this.send(mqtt.encodeConnack(sessionPresent, mqtt.RETURN_CODE.ACCEPTED));
     this.#touch();
+    if (sessionPresent) {
+      this.session.replay();
+    }
   }
 
   #publish(flags, body) {
@@ -118,15 +299,16 @@ class ClientConnection {
     if (body.length !== 2) {
       throw new ProtocolError("puback must contain exactly a packet identifier");
     }
-    this.pendingPacketIds.delete(body.readUInt16BE(0));
+    this.session.acknowledge(body.readUInt16BE(0));
   }
 
   #subscribe(body) {
     const subscribe = mqtt.decodeSubscribe(body);
     const returnCodes = [];
     for (const subscription of subscribe.subscriptions) {
-      this.subscriptions.set(subscription.filter, Math.min(subscription.qos, 1));
-      returnCodes.push(Math.min(subscription.qos, 1));
+      const granted = Math.min(subscription.qos, 1);
+      this.session.setSubscription(subscription.filter, granted);
+      returnCodes.push(granted);
     }
     this.send(mqtt.encodeSuback(subscribe.packetId, returnCodes));
     const delivered = new Set();
@@ -142,46 +324,17 @@ class ClientConnection {
       }
       if (granted !== null) {
         delivered.add(retained.topic);
-        this.#deliverTo(retained.topic, retained.payload, Math.min(retained.qos, granted), true);
+        this.session.sendTo(retained.topic, retained.payload, Math.min(retained.qos, granted), true);
       }
     }
   }
 
-  /** At most one copy per client, at the highest qos granted by its filters. */
+  /** Fan-out entry point for publications while this connection is online. */
   deliver(topic, payload, qos) {
-    if (this.id === null) {
+    if (this.session === null) {
       return;
     }
-    let granted = null;
-    for (const [filter, filterQos] of this.subscriptions) {
-      if (mqtt.topicMatches(filter, topic)) {
-        granted = granted === null ? filterQos : Math.max(granted, filterQos);
-      }
-    }
-    if (granted !== null) {
-      this.#deliverTo(topic, payload, Math.min(qos, granted), false);
-    }
-  }
-
-  #deliverTo(topic, payload, qos, retain) {
-    if (qos === 0) {
-      this.send(mqtt.encodePublish({ topic, payload, qos: 0, retain }));
-      return;
-    }
-    const packetId = this.#takePacketId();
-    this.pendingPacketIds.add(packetId);
-    this.send(mqtt.encodePublish({ topic, payload, qos: 1, packetId, retain }));
-  }
-
-  #takePacketId() {
-    for (let attempt = 0; attempt < 65535; attempt += 1) {
-      const candidate = this.nextPacketId;
-      this.nextPacketId = candidate === 65535 ? 1 : candidate + 1;
-      if (!this.pendingPacketIds.has(candidate)) {
-        return candidate;
-      }
-    }
-    throw new ProtocolError("no packet identifier is available for this connection");
+    this.session.deliver(topic, payload, qos, false);
   }
 
   send(buffer) {
@@ -225,6 +378,11 @@ class ClientConnection {
       this.timer = null;
     }
     this.broker.unregister(this);
+    if (this.session !== null) {
+      // A persistent session goes offline and keeps its state; a clean session
+      // is removed entirely.
+      this.session.detach(this);
+    }
     if (!this.graceful && this.will !== null) {
       this.broker.publish(this.will.topic, this.will.payload, { qos: this.will.qos, retain: this.will.retain });
     }
@@ -239,6 +397,10 @@ export class Broker {
     this.port = options.port ?? 1883;
     this.maxPacketBytes = options.maxPacketBytes ?? DEFAULT_MAX_PACKET_BYTES;
     this.connections = new Set();
+    this.sessions = new Map();
+    for (const clientId of this.store.listMqttSessionIds()) {
+      this.sessions.set(clientId, new Session(this, clientId, true));
+    }
     this.server = net.createServer((socket) => {
       this.connections.add(new ClientConnection(this, socket));
     });
@@ -274,6 +436,22 @@ export class Broker {
     this.connections.delete(connection);
   }
 
+  createSession(clientId, persistent) {
+    if (persistent) {
+      this.store.createMqttSession(clientId);
+    }
+    const session = new Session(this, clientId, persistent);
+    this.sessions.set(clientId, session);
+    return session;
+  }
+
+  /** Drop a persisted session (used when a clean session=1 connect succeeds). */
+  discardSession(clientId) {
+    if (this.sessions.delete(clientId)) {
+      this.store.deleteMqttSession(clientId);
+    }
+  }
+
   get clientIds() {
     return [...this.connections].filter((connection) => connection.id !== null).map((connection) => connection.id).sort();
   }
@@ -281,7 +459,8 @@ export class Broker {
   /**
    * Route one publication: retain it, fan it out to matching subscriptions and
    * then let the service evaluate mqtt rules. An empty retained payload clears
-   * the retained message for that topic.
+   * the retained message for that topic. Online connections receive real-time
+   * fan-out; offline persistent sessions queue effective QoS 1 messages.
    */
   publish(topic, payload, options = {}) {
     const { qos = 0, retain = false } = options;
@@ -296,6 +475,11 @@ export class Broker {
     }
     for (const connection of this.connections) {
       connection.deliver(topic, body, qos);
+    }
+    for (const session of this.sessions.values()) {
+      if (session.connection === null) {
+        session.deliver(topic, body, qos, false);
+      }
     }
     this.service.handlePublish(topic, body);
   }

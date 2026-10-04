@@ -42,7 +42,7 @@ Shadowlink MQTT broker listening on mqtt://127.0.0.1:8081
 | Packet | Value | Direction | Fixed header flags | Variables |
 | --- | --- | --- | --- | --- |
 | `CONNECT` | 1 | client → broker | `0` | protocol name `MQTT`, level `4`, flags, keep alive, client id, optional will |
-| `CONNACK` | 2 | broker → client | `0` | session present (`0`), return code |
+| `CONNACK` | 2 | broker → client | `0` | session present (`0` or `1`), return code |
 | `PUBLISH` | 3 | both | `DUP<<3 \| QoS<<1 \| RETAIN` | topic name, packet id when QoS > 0, payload |
 | `PUBACK` | 4 | both | `0` | packet id |
 | `SUBSCRIBE` | 8 | client → broker | `2` | packet id, then (topic filter, requested QoS) pairs |
@@ -53,8 +53,8 @@ Shadowlink MQTT broker listening on mqtt://127.0.0.1:8081
 
 Any other packet type, any wrong fixed header flag, or a first packet that is
 not `CONNECT` is a protocol error: the broker closes the connection without a
-reply. `UNSUBSCRIBE`, QoS 2, persistent sessions, username/password (return
-code `4`) and `will` QoS 2 are not supported.
+reply. `UNSUBSCRIBE`, QoS 2, username/password (return code `4`) and `will`
+QoS 2 are not supported.
 
 ### Remaining Length
 
@@ -80,13 +80,22 @@ is a protocol error.
 
 The connect flags byte carries, from bit 7 down: username, password, will
 retain, will QoS (2 bits), will flag, clean session, reserved. In this subset
-username and password must be absent, the reserved bit must be zero, the will
-QoS must be `0` or `1`, and clean session must be `1`. The client identifier
-must be 1 to 128 UTF-8 bytes and must not already be connected: a second
-connection that reuses a live identifier is refused with return code `2` and
-the existing connection keeps running. `CONNACK` always reports session
-present `0`. Return codes are `0` accepted, `1` unacceptable protocol version,
-`2` identifier rejected, `3` server unavailable, `4` bad username/password.
+username and password must be absent, the reserved bit must be zero, and the
+will QoS must be `0` or `1`. The client identifier must be 1 to 128 UTF-8
+bytes and must not already be connected: a second connection that reuses a
+live identifier is refused with return code `2` and the existing connection
+keeps running. Return codes are `0` accepted, `1` unacceptable protocol
+version, `2` identifier rejected, `3` server unavailable, `4` bad
+username/password.
+
+With **clean session = 1** the connection always starts a fresh, in-memory
+session: any stored session for that client id is deleted first, `CONNACK`
+reports session present `0`, and every subscription and unacknowledged
+delivery is discarded when the connection closes. With **clean session = 0**
+the broker creates a persistent session on first connect (session present
+`0`) or restores the stored one (session present `1`). A persistent session
+survives network drops, a graceful `DISCONNECT` and a broker restart; its
+subscriptions and queued/in-flight outbound QoS 1 messages live in SQLite.
 
 A `CONNECT` that fails for one of those reasons is answered with the matching
 return code and then closed; every other malformed packet closes the connection
@@ -95,7 +104,8 @@ without a reply.
 With a non-zero keep alive the broker drops a client that sends nothing for
 1.5 times the interval. If the connection ends without a `DISCONNECT` — socket
 error, keep alive expiry, protocol error — the will is published to its topic
-at its QoS and retain flag. A graceful `DISCONNECT` never publishes the will.
+at its QoS and retain flag. A graceful `DISCONNECT` never publishes the will
+and never deletes a persistent session.
 
 Verified bytes for `CONNECT` with client id `sensor-1`, clean session and keep
 alive 60, then the matching `CONNACK`, a `SUBSCRIBE` of `sensors/+/temp` with
@@ -154,15 +164,40 @@ publisher itself when it subscribes to its own topic. Granted QoS is
 Inbound QoS 1 publications are acknowledged with `PUBACK` after routing. A
 packet id that was already acknowledged on the same connection is acknowledged
 again but **not routed twice**, whether or not `DUP` is set, which makes client
-retransmissions idempotent. Outbound QoS 1 publications get a per-connection
-packet id starting at 1 that skips ids still awaiting `PUBACK`; this broker
-does not retransmit them itself.
+retransmissions idempotent. Outbound QoS 1 publications get a per-session
+packet id starting at 1 that skips ids still awaiting `PUBACK`.
 
 A `PUBLISH` with `RETAIN` and a non-empty payload replaces the retained message
 for its topic; an empty payload with `RETAIN` clears it. Retained messages are
 delivered only when a `SUBSCRIBE` arrives, at `min(subscription QoS, retained
 QoS)`, with `RETAIN` set, at most one copy per topic per `SUBSCRIBE`. Normal
-fan-out always clears `RETAIN`. Retained replays are not rule inputs.
+fan-out always clears `RETAIN`. Retained replays are not rule inputs and are
+never replayed just because a persistent session is restored.
+
+### Persistent sessions
+
+For a client connected with clean session = 0:
+
+- every filter accepted by a `SUBSCRIBE` is saved; resubmitting the same
+  filter overwrites its QoS with the newly granted value, and no
+  re-subscription is needed after reconnecting;
+- while the client is offline, a matching normal publication is queued only
+  when its effective delivery QoS (`min(published QoS, highest granted QoS)`)
+  is 1; effective QoS 0 publications are dropped, and multiple matching
+  filters still merge into one copy at the highest granted QoS;
+- queued messages keep publication order, and later subscription changes never
+  remove or alter a message already queued;
+- wills and broker-internal publications (such as shadow deltas) follow the
+  same matching and offline-queue rules.
+
+After sending `CONNACK` the broker first resends the messages that were already
+sent but never `PUBACK`ed, in their original send order, keeping their original
+packet ids and setting `DUP=1`; it then sends the never-sent queued messages in
+enqueue order, assigning each an available non-zero packet id with `DUP=0`.
+Each `PUBACK` removes only that one in-flight message, so a drop during replay
+means the still-unacknowledged messages (again with `DUP=1`) and the
+never-sent remainder are delivered by the same rules on the next reconnect,
+and an acknowledged message is never sent again.
 
 ### Reserved topics
 
@@ -428,6 +463,6 @@ and repeating a query against an unchanged event set returns the same events.
 node --test tests/
 ```
 
-`node --test` and `node --test "tests/*.test.js"` run the same 100 tests;
+`node --test` and `node --test "tests/*.test.js"` run the same 111 tests;
 `tests/index.js` exists so the directory form also works on Node 22, which does
 not expand a directory argument on its own.

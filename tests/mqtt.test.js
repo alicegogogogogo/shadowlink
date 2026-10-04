@@ -90,7 +90,8 @@ test("connect packets reject unsupported protocol versions and empty client ids"
   wrongLevel[6] = 5;
   assert.throws(() => mqtt.decodeConnect(wrongLevel), (error) => error instanceof ProtocolError && error.returnCode === 1);
   assert.throws(() => mqtt.decodeConnect(connectPacket({ clientId: "" }).subarray(2)), (error) => error.returnCode === 2);
-  assert.throws(() => mqtt.decodeConnect(connectPacket({ clientId: "device-1", cleanSession: false }).subarray(2)), ProtocolError);
+  const persistent = mqtt.decodeConnect(connectPacket({ clientId: "device-1", cleanSession: false }).subarray(2));
+  assert.equal(persistent.cleanSession, false);
 });
 
 test("publish packets round-trip with qos 0 and qos 1", () => {
