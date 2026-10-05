@@ -1,4 +1,7 @@
+import { Buffer } from "node:buffer";
+
 import { ConflictError, NotFoundError, ValidationError } from "./errors.js";
+import { parseCommand } from "./commands.js";
 import { topicMatches } from "./mqtt.js";
 import { evaluateCondition, identifier, isIdentifier, matchedValue, parseRule } from "./rules.js";
 import { computeDelta, parseReportedPatch, parseShadowPatch } from "./shadow.js";
@@ -25,6 +28,7 @@ export class Service {
     this.store = new Store(database);
     this.now = options.now ?? (() => new Date().toISOString());
     this.publisher = null;
+    this.commandSender = null;
   }
 
   close() {
@@ -34,6 +38,15 @@ export class Service {
   /** The broker registers itself here so shadow writes can publish deltas. */
   setPublisher(publisher) {
     this.publisher = publisher;
+  }
+
+  /**
+   * The broker registers its command delivery entry point here. It receives
+   * `(deviceId, payload)` and returns the packet id of the in-flight QoS 1
+   * delivery, or null when the device cannot receive a command right now.
+   */
+  setCommandSender(sender) {
+    this.commandSender = sender;
   }
 
   health() {
@@ -163,6 +176,107 @@ export class Service {
       })),
     };
   }
+
+  /**
+   * Create a persistent offline command for a device. The command starts
+   * queued and is delivered by the broker once the device's own persistent
+   * session is online and subscribed; the create response is the document as
+   * first written, and replaying the same Idempotency-Key returns it again.
+   */
+  createCommand(rawDeviceId, raw, key) {
+    const deviceId = identifier(rawDeviceId, "device id");
+    const parsed = parseCommand(raw, this.clock());
+    const command = this.#idempotent(key, `create-command:${deviceId}:${parsed.id}`, () => {
+      if (this.store.getCommand(deviceId, parsed.id) !== null) {
+        throw new ConflictError(`command ${parsed.id} already exists for device ${deviceId}`);
+      }
+      const document = {
+        device_id: deviceId,
+        id: parsed.id,
+        payload: parsed.payload,
+        status: "queued",
+        created_at: this.now(),
+        expires_at: parsed.expiresAt,
+        delivered_at: null,
+      };
+      this.store.insertCommand(document);
+      return document;
+    });
+    this.#kickCommands(deviceId);
+    return command;
+  }
+
+  /**
+   * Read one command. Reaching its expires_at flips a still-undelivered
+   * command to expired here (the same judgement the delivery path applies),
+   * which may also free the queue for the next command.
+   */
+  getCommand(rawDeviceId, rawCommandId) {
+    const deviceId = identifier(rawDeviceId, "device id");
+    const commandId = identifier(rawCommandId, "command id");
+    this.store.expireCommands(deviceId, this.now());
+    const command = this.store.getCommand(deviceId, commandId);
+    if (command === null) {
+      throw new NotFoundError(`device ${deviceId} has no command ${commandId}`);
+    }
+    this.#kickCommands(deviceId);
+    return command;
+  }
+
+  /**
+   * A PUBACK arrived on the connection of `deviceId`. When it names the
+   * command currently waiting for its acknowledgement, that command becomes
+   * delivered; any unrelated or duplicate PUBACK changes nothing. Either way
+   * the queue is given a chance to advance.
+   */
+  commandAcknowledged(deviceId, packetId) {
+    const inflight = this.store.getQueuedCommandByPacketId(deviceId, packetId);
+    if (inflight !== null) {
+      this.store.markCommandDelivered(deviceId, inflight.id, this.now());
+    }
+    this.#kickCommands(deviceId);
+  }
+
+  /** The broker calls this when a connection or subscription may have made a device's queue deliverable. */
+  commandChannelReady(deviceId) {
+    this.#kickCommands(deviceId);
+  }
+
+  /**
+   * The persistent session of `deviceId` was discarded (a clean-session
+   * connect took the identifier), so the deliveries it tracked are gone:
+   * every command it was sending becomes sendable again.
+   */
+  commandSessionDiscarded(deviceId) {
+    this.store.resetInflightCommands(deviceId);
+  }
+
+  /**
+   * Advance one device's command queue by at most one send: expire due
+   * commands, stop when another command is still awaiting its PUBACK, and
+   * otherwise hand the oldest never-sent command to the broker. At most one
+   * command per device is ever in flight, and commands are sent in creation
+   * order. A command the broker cannot send right now stays queued.
+   */
+  #kickCommands(deviceId) {
+    if (this.commandSender === null) {
+      return;
+    }
+    this.store.expireCommands(deviceId, this.now());
+    if (this.store.getInflightCommand(deviceId) !== null) {
+      return;
+    }
+    const next = this.store.nextPendingCommand(deviceId);
+    if (next === null) {
+      return;
+    }
+    const payload = Buffer.from(JSON.stringify({ id: next.id, payload: next.payload }), "utf8");
+    const packetId = this.commandSender(deviceId, payload);
+    if (packetId !== null && packetId !== undefined) {
+      this.store.markCommandSent(deviceId, next.id, packetId);
+    }
+  }
+
 
   /**
    * Called by the broker for every routed publication: the reserved shadow

@@ -64,6 +64,19 @@ CREATE TABLE IF NOT EXISTS telemetry_samples (
   value REAL NOT NULL,
   seq INTEGER PRIMARY KEY AUTOINCREMENT
 );
+CREATE TABLE IF NOT EXISTS commands (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  delivered_at TEXT,
+  packet_id INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS commands_device_id
+  ON commands (device_id, id);
 CREATE INDEX IF NOT EXISTS telemetry_query
   ON telemetry_samples (device_id, metric, ts);
 CREATE INDEX IF NOT EXISTS mqtt_outbound_query
@@ -383,5 +396,89 @@ export class Store {
       )
       .all(widthMs, widthMs, widthMs, deviceId, metric, fromMs, toMs)
       .map((row) => ({ startMs: row.bucket, value: row.value, count: row.count }));
+  }
+
+  /**
+   * Rebuild the public command document from its row. The payload is stored
+   * as JSON so the value read back is structurally identical to the value
+   * that was written.
+   */
+  commandDocument(row) {
+    return {
+      device_id: row.device_id,
+      id: row.id,
+      payload: this.decode(row.payload),
+      status: row.status,
+      created_at: row.created_at,
+      expires_at: row.expires_at,
+      delivered_at: row.delivered_at,
+    };
+  }
+
+  insertCommand(command) {
+    this.database
+      .prepare(
+        "INSERT INTO commands (device_id, id, payload, status, created_at, expires_at, delivered_at, packet_id) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)",
+      )
+      .run(command.device_id, command.id, this.encode(command.payload), command.status, command.created_at, command.expires_at);
+  }
+
+  getCommand(deviceId, id) {
+    const row = this.database.prepare("SELECT * FROM commands WHERE device_id = ? AND id = ?").get(deviceId, id);
+    return row ? this.commandDocument(row) : null;
+  }
+
+  /** The queued command already sent and still waiting for its PUBACK. */
+  getInflightCommand(deviceId) {
+    const row = this.database
+      .prepare("SELECT * FROM commands WHERE device_id = ? AND status = 'queued' AND packet_id IS NOT NULL ORDER BY seq LIMIT 1")
+      .get(deviceId);
+    return row ? this.commandDocument(row) : null;
+  }
+
+  /** The oldest queued command that was never sent, in creation order. */
+  nextPendingCommand(deviceId) {
+    const row = this.database
+      .prepare("SELECT * FROM commands WHERE device_id = ? AND status = 'queued' AND packet_id IS NULL ORDER BY seq LIMIT 1")
+      .get(deviceId);
+    return row ? this.commandDocument(row) : null;
+  }
+
+  /** The queued command whose in-flight delivery carries `packetId`. */
+  getQueuedCommandByPacketId(deviceId, packetId) {
+    const row = this.database
+      .prepare("SELECT * FROM commands WHERE device_id = ? AND status = 'queued' AND packet_id = ?")
+      .get(deviceId, packetId);
+    return row ? this.commandDocument(row) : null;
+  }
+
+  markCommandSent(deviceId, id, packetId) {
+    this.database.prepare("UPDATE commands SET packet_id = ? WHERE device_id = ? AND id = ?").run(packetId, deviceId, id);
+  }
+
+  /**
+   * Forget the in-flight delivery of every queued command of the device, so
+   * each becomes sendable again. Used when the persistent session that
+   * tracked those deliveries is discarded.
+   */
+  resetInflightCommands(deviceId) {
+    this.database.prepare("UPDATE commands SET packet_id = NULL WHERE device_id = ? AND status = 'queued'").run(deviceId);
+  }
+
+  markCommandDelivered(deviceId, id, deliveredAt) {
+    this.database
+      .prepare("UPDATE commands SET status = 'delivered', delivered_at = ? WHERE device_id = ? AND id = ?")
+      .run(deliveredAt, deviceId, id);
+  }
+
+  /**
+   * Mark every still-undelivered command of the device whose expires_at was
+   * reached as expired. Timestamps are canonical RFC3339 UTC at millisecond
+   * precision, so a lexical comparison is exact.
+   */
+  expireCommands(deviceId, now) {
+    this.database
+      .prepare("UPDATE commands SET status = 'expired' WHERE device_id = ? AND status = 'queued' AND expires_at <= ?")
+      .run(deviceId, now);
   }
 }

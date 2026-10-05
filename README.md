@@ -10,6 +10,8 @@ The release intentionally supports a compact public contract:
   `SUBACK`, `PINGREQ`, `PINGRESP` and `DISCONNECT` for QoS 0 and QoS 1;
 - a shadow stores `desired` and `reported` state and derives `delta` from them;
 - a rule fires an event on a shadow transition or on a matching publication;
+- a persistent command queue delivers device commands one at a time to the
+  device's own persistent session, with expiry and QoS 1 redelivery;
 - every state change is written to SQLite, and `Idempotency-Key` makes
   repeating a POST return the first response instead of applying it twice.
 
@@ -259,6 +261,56 @@ A missing, duplicated or unknown parameter, an illegal `device_id` or `metric`,
 a malformed timestamp, `from` at or after `to`, or an out-of-range
 `bucket_seconds`/`aggregate` is rejected with `400 validation_error`.
 
+## Device commands
+
+A command is a persistent, offline-capable instruction for one device. It is
+created over HTTP, stored in SQLite (so it survives restarts), and delivered
+over MQTT only to the device's own persistent session: the connection whose
+client id equals the device id, connected with clean session = 0 and
+subscribed with QoS 1 to exactly `$commands/<deviceId>`. No other client ever
+receives a command, and command deliveries never trigger `mqtt` rules, write
+events or create retained messages.
+
+Commands are sent one at a time per device, in creation order, as a QoS 1
+`PUBLISH` with `RETAIN` clear on `$commands/<deviceId>` whose payload is
+`{"id":<command id>,"payload":<original value>}`. The next command is sent
+only after the in-flight one is `PUBACK`ed, which marks it `delivered` and
+stamps `delivered_at`. If the connection drops before the `PUBACK`, the
+normal persistent-session rules resend the message on reconnect with the same
+packet id and `DUP=1`; unrelated or duplicate `PUBACK`s change nothing. A
+command whose `expires_at` is reached while still undelivered becomes
+`expired` — the judgement runs on every query and before every delivery — is
+never sent, and keeps `delivered_at: null`.
+
+### `POST /devices/{deviceId}/commands`
+
+The body is exactly `{"id": ..., "payload": ..., "expires_at": ...}`: every
+field is required and no other field is allowed. `id` follows the usual
+identifier rule and is unique within the device, `payload` is any JSON value,
+and `expires_at` is an RFC3339 UTC timestamp ending in `Z` that must be later
+than the moment the command is received. The response is `201` with the
+stored document; all timestamps carry millisecond precision.
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/devices/sensor-1/commands \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cmd-1' \
+  -d '{"id":"reboot-1","payload":{"delay":5},"expires_at":"2024-05-01T12:00:00Z"}'
+```
+```json
+{"device_id":"sensor-1","id":"reboot-1","payload":{"delay":5},"status":"queued",
+ "created_at":"2024-05-01T10:00:00.000Z","expires_at":"2024-05-01T12:00:00.000Z",
+ "delivered_at":null}
+```
+
+`status` is `queued`, `delivered` or `expired`. Replaying the same
+`Idempotency-Key` returns the first response; the same command `id` under a
+new key is `409 conflict`.
+
+### `GET /devices/{deviceId}/commands/{commandId}`
+
+Returns the current command document, or `404 not_found` when the device has
+no such command.
+
 ## Device shadows
 
 A shadow document is exactly:
@@ -452,9 +504,9 @@ and repeating a query against an unchanged event set returns the same events.
 
 | Code | Status | Raised by |
 | --- | --- | --- |
-| `validation_error` | 400 | malformed JSON, wrong content type, unknown or missing field, invalid identifier, topic filter, path, operator or event name |
-| `not_found` | 404 | unknown route, unknown device shadow |
-| `conflict` | 409 | duplicate rule id, `Idempotency-Key` reused for another operation |
+| `validation_error` | 400 | malformed JSON, wrong content type, unknown or missing field, invalid identifier, topic filter, path, operator, event name or `expires_at` |
+| `not_found` | 404 | unknown route, unknown device shadow, unknown command |
+| `conflict` | 409 | duplicate rule id, duplicate command id, `Idempotency-Key` reused for another operation |
 | `protocol_error` | — | MQTT transport only: the broker closes the connection |
 
 ## Tests
@@ -463,6 +515,6 @@ and repeating a query against an unchanged event set returns the same events.
 node --test tests/
 ```
 
-`node --test` and `node --test "tests/*.test.js"` run the same 111 tests;
+`node --test` and `node --test "tests/*.test.js"` run the same 125 tests;
 `tests/index.js` exists so the directory form also works on Node 22, which does
 not expand a directory argument on its own.

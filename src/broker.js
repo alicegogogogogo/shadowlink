@@ -105,7 +105,7 @@ class Session {
 
   /** Deliver a message whose matching was already decided (a retained replay). */
   sendTo(topic, payload, qos, retain) {
-    this.#sendTo(topic, payload, qos, retain);
+    return this.#sendTo(topic, payload, qos, retain);
   }
 
   #enqueue(topic, payload, qos) {
@@ -116,10 +116,11 @@ class Session {
     }
   }
 
+  /** Send immediately; returns the packet id of a QoS 1 delivery, else null. */
   #sendTo(topic, payload, qos, retain) {
     if (qos === 0) {
       this.connection.send(mqtt.encodePublish({ topic, payload, qos: 0, retain }));
-      return;
+      return null;
     }
     const packetId = this.#takePacketId();
     if (this.persistent) {
@@ -129,6 +130,7 @@ class Session {
       this.store.insertMqttOutbound(this.id, { packetId, topic, payload, qos: 1, retain: false });
     }
     this.connection.send(mqtt.encodePublish({ topic, payload, qos: 1, packetId, retain }));
+    return packetId;
   }
 
   #takePacketId() {
@@ -279,6 +281,7 @@ class ClientConnection {
     if (sessionPresent) {
       this.session.replay();
     }
+    this.broker.service.commandChannelReady(this.id);
   }
 
   #publish(flags, body) {
@@ -299,7 +302,9 @@ class ClientConnection {
     if (body.length !== 2) {
       throw new ProtocolError("puback must contain exactly a packet identifier");
     }
-    this.session.acknowledge(body.readUInt16BE(0));
+    const packetId = body.readUInt16BE(0);
+    this.session.acknowledge(packetId);
+    this.broker.service.commandAcknowledged(this.id, packetId);
   }
 
   #subscribe(body) {
@@ -327,6 +332,7 @@ class ClientConnection {
         this.session.sendTo(retained.topic, retained.payload, Math.min(retained.qos, granted), true);
       }
     }
+    this.broker.service.commandChannelReady(this.id);
   }
 
   /** Fan-out entry point for publications while this connection is online. */
@@ -449,11 +455,33 @@ export class Broker {
   discardSession(clientId) {
     if (this.sessions.delete(clientId)) {
       this.store.deleteMqttSession(clientId);
+      this.service.commandSessionDiscarded(clientId);
     }
   }
 
   get clientIds() {
     return [...this.connections].filter((connection) => connection.id !== null).map((connection) => connection.id).sort();
+  }
+
+  /**
+   * Send one device command on the reserved `$commands/<deviceId>` topic.
+   * Only the device's own persistent session qualifies: it must be online and
+   * hold a QoS 1 subscription to exactly that topic. The delivery is a normal
+   * outbound QoS 1 message of that session, so an unacknowledged command is
+   * retransmitted with its packet id and DUP set on the next reconnect.
+   * Returns the packet id of the in-flight delivery, or null when the command
+   * cannot be sent right now.
+   */
+  sendCommand(deviceId, payload) {
+    const session = this.sessions.get(deviceId);
+    if (session === undefined || !session.persistent || session.connection === null) {
+      return null;
+    }
+    const topic = `$commands/${deviceId}`;
+    if (session.subscriptions.get(topic) !== 1) {
+      return null;
+    }
+    return session.sendTo(topic, payload, 1, false);
   }
 
   /**
