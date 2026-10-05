@@ -216,6 +216,13 @@ async function dispatch(service, request) {
     const body = await readJson(request);
     return { status: 200, body: service.reportState(parts[1], body, request.headers["idempotency-key"]) };
   }
+  if (method === "POST" && parts.length === 3 && parts[0] === "devices" && parts[2] === "commands") {
+    const body = await readJson(request);
+    return { status: 201, body: service.createCommand(parts[1], body, request.headers["idempotency-key"]) };
+  }
+  if (method === "GET" && parts.length === 4 && parts[0] === "devices" && parts[2] === "commands") {
+    return { status: 200, body: service.getCommand(parts[1], parts[3]) };
+  }
   if (method === "POST" && parts.length === 1 && parts[0] === "rules") {
     const body = await readJson(request);
     return { status: 201, body: service.createRule(body, request.headers["idempotency-key"]) };
@@ -238,6 +245,7 @@ export async function start(options = {}) {
   const service = new Service(options.database ?? "shadowlink.db", options.now === undefined ? {} : { now: options.now });
   const broker = new Broker(service, { host, port: options.mqttPort ?? port + 1 });
   service.setPublisher((topic, payload, publishOptions) => broker.publish(topic, payload, publishOptions));
+  service.setCommandSender((deviceId, command) => broker.sendCommand(deviceId, command));
   await broker.listen();
   const httpServer = http.createServer((request, response) => {
     dispatch(service, request)

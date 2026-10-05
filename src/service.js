@@ -1,3 +1,4 @@
+import { parseCommand } from "./commands.js";
 import { ConflictError, NotFoundError, ValidationError } from "./errors.js";
 import { topicMatches } from "./mqtt.js";
 import { evaluateCondition, identifier, isIdentifier, matchedValue, parseRule } from "./rules.js";
@@ -25,6 +26,7 @@ export class Service {
     this.store = new Store(database);
     this.now = options.now ?? (() => new Date().toISOString());
     this.publisher = null;
+    this.commandSender = null;
   }
 
   close() {
@@ -34,6 +36,15 @@ export class Service {
   /** The broker registers itself here so shadow writes can publish deltas. */
   setPublisher(publisher) {
     this.publisher = publisher;
+  }
+
+  /**
+   * The broker registers its command delivery entry point here: it receives a
+   * device id and a stored command row and returns the packet id of the QoS 1
+   * PUBLISH it sent, or null when no eligible connection is currently ready.
+   */
+  setCommandSender(sender) {
+    this.commandSender = sender;
   }
 
   health() {
@@ -68,6 +79,110 @@ export class Service {
     const deviceId = identifier(rawDeviceId, "device id");
     const patch = parseReportedPatch(raw);
     return this.#idempotent(key, `report-state:${deviceId}`, () => this.applyShadowPatch(deviceId, patch));
+  }
+
+  /**
+   * Create a persistent offline command. The stored document starts queued
+   * with no delivered_at; the idempotency operation names the device and the
+   * command id, so a replayed key returns the first response while the same
+   * command id under a fresh key is a conflict.
+   */
+  createCommand(rawDeviceId, raw, key) {
+    const deviceId = identifier(rawDeviceId, "device id");
+    const draft = parseCommand(raw, this.clock());
+    const command = this.#idempotent(key, `create-command:${deviceId}:${draft.id}`, () => {
+      if (this.store.getCommand(deviceId, draft.id) !== null) {
+        throw new ConflictError(`command ${draft.id} already exists for device ${deviceId}`);
+      }
+      const document = {
+        device_id: deviceId,
+        id: draft.id,
+        payload: draft.payload,
+        status: "queued",
+        created_at: this.now(),
+        expires_at: draft.expires_at,
+        delivered_at: null,
+      };
+      this.store.insertCommand(document);
+      return document;
+    });
+    this.pumpCommands(deviceId);
+    return command;
+  }
+
+  /**
+   * Fetch one command. The expiry judgement runs first, so a queued command
+   * whose deadline has passed is reported (and stored) as expired.
+   */
+  getCommand(rawDeviceId, rawCommandId) {
+    const deviceId = identifier(rawDeviceId, "device id");
+    const commandId = identifier(rawCommandId, "command id");
+    this.store.expireCommands(deviceId, this.now());
+    const command = this.store.getCommand(deviceId, commandId);
+    if (command === null) {
+      throw new NotFoundError(`device ${deviceId} has no command ${commandId}`);
+    }
+    return Service.publicCommand(command);
+  }
+
+  /**
+   * A PUBACK arrived on the connection of `clientId`. When it matches the
+   * in-flight command of that device the command becomes delivered and the
+   * next one is pumped; any unrelated or duplicate PUBACK changes nothing.
+   */
+  handleCommandPuback(clientId, packetId) {
+    const inflight = this.store.findCommandByPacketId(clientId, packetId);
+    if (inflight === null) {
+      return;
+    }
+    this.store.markCommandDelivered(clientId, inflight.id, this.now());
+    this.pumpCommands(clientId);
+  }
+
+  /**
+   * A persistent session for `clientId` was discarded, so its in-flight
+   * command (if any) goes back to unsent: the outbound copy is gone and a
+   * future eligible session must be able to receive it.
+   */
+  resetCommandDelivery(clientId) {
+    this.store.resetCommandDelivery(clientId);
+  }
+
+  /**
+   * Try to move one queued command of a device onto the wire. At most one
+   * command per device awaits its PUBACK: when one is already in flight, or
+   * no eligible connection is ready, nothing happens. Unsent commands whose
+   * deadline has passed become expired instead of being sent.
+   */
+  pumpCommands(deviceId) {
+    if (this.commandSender === null) {
+      return;
+    }
+    this.store.expireCommands(deviceId, this.now());
+    if (this.store.getInflightCommand(deviceId) !== null) {
+      return;
+    }
+    const next = this.store.getNextQueuedCommand(deviceId);
+    if (next === null) {
+      return;
+    }
+    const packetId = this.commandSender(deviceId, next);
+    if (packetId !== null && packetId !== undefined) {
+      this.store.markCommandSent(deviceId, next.id, packetId);
+    }
+  }
+
+  /** The public representation of a stored command row. */
+  static publicCommand(command) {
+    return {
+      device_id: command.device_id,
+      id: command.id,
+      payload: command.payload,
+      status: command.status,
+      created_at: command.created_at,
+      expires_at: command.expires_at,
+      delivered_at: command.delivered_at,
+    };
   }
 
   /**

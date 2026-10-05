@@ -119,7 +119,7 @@ class Session {
   #sendTo(topic, payload, qos, retain) {
     if (qos === 0) {
       this.connection.send(mqtt.encodePublish({ topic, payload, qos: 0, retain }));
-      return;
+      return null;
     }
     const packetId = this.#takePacketId();
     if (this.persistent) {
@@ -129,6 +129,17 @@ class Session {
       this.store.insertMqttOutbound(this.id, { packetId, topic, payload, qos: 1, retain: false });
     }
     this.connection.send(mqtt.encodePublish({ topic, payload, qos: 1, packetId, retain }));
+    return packetId;
+  }
+
+  /**
+   * Send a broker-originated command to this session at QoS 1 with RETAIN
+   * clear and return its packet id. The message joins the same in-flight
+   * store as normal deliveries, so a reconnect replays it with its original
+   * packet id and DUP set.
+   */
+  sendCommandMessage(topic, payload) {
+    return this.#sendTo(topic, payload, 1, false);
   }
 
   #takePacketId() {
@@ -279,6 +290,8 @@ class ClientConnection {
     if (sessionPresent) {
       this.session.replay();
     }
+    // A (re)connected device may now be eligible for its queued commands.
+    this.broker.service.pumpCommands(this.id);
   }
 
   #publish(flags, body) {
@@ -299,7 +312,9 @@ class ClientConnection {
     if (body.length !== 2) {
       throw new ProtocolError("puback must contain exactly a packet identifier");
     }
-    this.session.acknowledge(body.readUInt16BE(0));
+    const packetId = body.readUInt16BE(0);
+    this.session.acknowledge(packetId);
+    this.broker.service.handleCommandPuback(this.id, packetId);
   }
 
   #subscribe(body) {
@@ -327,6 +342,9 @@ class ClientConnection {
         this.session.sendTo(retained.topic, retained.payload, Math.min(retained.qos, granted), true);
       }
     }
+    // A new or upgraded subscription may make this device eligible for its
+    // queued commands.
+    this.broker.service.pumpCommands(this.id);
   }
 
   /** Fan-out entry point for publications while this connection is online. */
@@ -449,7 +467,29 @@ export class Broker {
   discardSession(clientId) {
     if (this.sessions.delete(clientId)) {
       this.store.deleteMqttSession(clientId);
+      this.service.resetCommandDelivery(clientId);
     }
+  }
+
+  /**
+   * Deliver one queued command to its device. Only a persistent session whose
+   * client id equals the device id, currently connected and subscribed at
+   * QoS 1 to the exact `$commands/<deviceId>` topic, is eligible; anything
+   * else (clean sessions, wildcard or QoS 0 subscriptions, other clients)
+   * receives nothing and the command stays queued. Returns the packet id of
+   * the QoS 1 PUBLISH, or null when no eligible connection is ready.
+   */
+  sendCommand(deviceId, command) {
+    const session = this.sessions.get(deviceId);
+    if (session === undefined || !session.persistent || session.connection === null) {
+      return null;
+    }
+    const topic = `$commands/${deviceId}`;
+    if (session.subscriptions.get(topic) !== 1) {
+      return null;
+    }
+    const payload = Buffer.from(JSON.stringify({ id: command.id, payload: command.payload }), "utf8");
+    return session.sendCommandMessage(topic, payload);
   }
 
   get clientIds() {

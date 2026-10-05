@@ -64,10 +64,24 @@ CREATE TABLE IF NOT EXISTS telemetry_samples (
   value REAL NOT NULL,
   seq INTEGER PRIMARY KEY AUTOINCREMENT
 );
+CREATE TABLE IF NOT EXISTS commands (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  delivered_at TEXT,
+  packet_id INTEGER,
+  UNIQUE (device_id, id)
+);
 CREATE INDEX IF NOT EXISTS telemetry_query
   ON telemetry_samples (device_id, metric, ts);
 CREATE INDEX IF NOT EXISTS mqtt_outbound_query
   ON mqtt_outbound (client_id, seq);
+CREATE INDEX IF NOT EXISTS commands_queue
+  ON commands (device_id, seq);
 `;
 
 export class Store {
@@ -383,5 +397,93 @@ export class Store {
       )
       .all(widthMs, widthMs, widthMs, deviceId, metric, fromMs, toMs)
       .map((row) => ({ startMs: row.bucket, value: row.value, count: row.count }));
+  }
+
+  #decodeCommand(row) {
+    return {
+      device_id: row.device_id,
+      id: row.id,
+      payload: this.decode(row.payload),
+      status: row.status,
+      created_at: row.created_at,
+      expires_at: row.expires_at,
+      delivered_at: row.delivered_at,
+      packet_id: row.packet_id,
+    };
+  }
+
+  /** Persist a freshly created command in the queued state. */
+  insertCommand(command) {
+    this.database
+      .prepare(
+        `INSERT INTO commands (device_id, id, payload, status, created_at, expires_at, delivered_at, packet_id)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)`,
+      )
+      .run(command.device_id, command.id, this.encode(command.payload), command.status, command.created_at, command.expires_at);
+  }
+
+  getCommand(deviceId, id) {
+    const row = this.database.prepare("SELECT * FROM commands WHERE device_id = ? AND id = ?").get(deviceId, id);
+    return row ? this.#decodeCommand(row) : null;
+  }
+
+  /** The oldest queued command of a device that has not been sent yet. */
+  getNextQueuedCommand(deviceId) {
+    const row = this.database
+      .prepare("SELECT * FROM commands WHERE device_id = ? AND status = 'queued' AND packet_id IS NULL ORDER BY seq LIMIT 1")
+      .get(deviceId);
+    return row ? this.#decodeCommand(row) : null;
+  }
+
+  /** The queued command already sent and awaiting its PUBACK, if any. */
+  getInflightCommand(deviceId) {
+    const row = this.database
+      .prepare("SELECT * FROM commands WHERE device_id = ? AND status = 'queued' AND packet_id IS NOT NULL ORDER BY seq LIMIT 1")
+      .get(deviceId);
+    return row ? this.#decodeCommand(row) : null;
+  }
+
+  /** The in-flight command a PUBACK refers to, or null when it is unrelated. */
+  findCommandByPacketId(deviceId, packetId) {
+    const row = this.database
+      .prepare("SELECT * FROM commands WHERE device_id = ? AND status = 'queued' AND packet_id = ?")
+      .get(deviceId, packetId);
+    return row ? this.#decodeCommand(row) : null;
+  }
+
+  markCommandSent(deviceId, id, packetId) {
+    this.database
+      .prepare("UPDATE commands SET packet_id = ? WHERE device_id = ? AND id = ? AND status = 'queued'")
+      .run(packetId, deviceId, id);
+  }
+
+  markCommandDelivered(deviceId, id, deliveredAt) {
+    this.database
+      .prepare("UPDATE commands SET status = 'delivered', delivered_at = ? WHERE device_id = ? AND id = ?")
+      .run(deliveredAt, deviceId, id);
+  }
+
+  /**
+   * Expire the unsent queued commands of a device whose deadline has been
+   * reached. `now` is canonical RFC3339 UTC at millisecond precision, exactly
+   * the shape expires_at is stored in, so a lexical comparison is exact. A
+   * command already sent (packet_id set) is in the hands of the QoS 1
+   * retransmission machinery and is left alone.
+   */
+  expireCommands(deviceId, now) {
+    this.database
+      .prepare("UPDATE commands SET status = 'expired' WHERE device_id = ? AND status = 'queued' AND packet_id IS NULL AND expires_at <= ?")
+      .run(deviceId, now);
+  }
+
+  /**
+   * Forget the in-flight marker of a device whose persistent session was
+   * discarded (a clean session=1 connect): the outbound copy is gone, so the
+   * command becomes unsent again and can be delivered to a future session.
+   */
+  resetCommandDelivery(deviceId) {
+    this.database
+      .prepare("UPDATE commands SET packet_id = NULL WHERE device_id = ? AND status = 'queued' AND packet_id IS NOT NULL")
+      .run(deviceId);
   }
 }

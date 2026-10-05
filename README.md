@@ -10,6 +10,8 @@ The release intentionally supports a compact public contract:
   `SUBACK`, `PINGREQ`, `PINGRESP` and `DISCONNECT` for QoS 0 and QoS 1;
 - a shadow stores `desired` and `reported` state and derives `delta` from them;
 - a rule fires an event on a shadow transition or on a matching publication;
+- a persistent offline command queue delivers commands to devices one at a
+  time over QoS 1;
 - every state change is written to SQLite, and `Idempotency-Key` makes
   repeating a POST return the first response instead of applying it twice.
 
@@ -297,6 +299,56 @@ Given `desired {"report_interval":30,"mode":"eco","config":{"gain":2}}` and
 `reported {"mode":"eco","config":{"gain":3}}`, the delta is
 `{"report_interval":30,"config":{"gain":2}}`.
 
+## Device commands
+
+A command is a persistent offline instruction created over HTTP and delivered
+to its device over MQTT. Commands live in SQLite and survive restarts.
+
+```json
+{"device_id":"sensor-1","id":"reboot","payload":{"delay":5},"status":"queued",
+ "created_at":"2024-05-01T10:00:00.000Z","expires_at":"2024-05-01T11:00:00.000Z",
+ "delivered_at":null}
+```
+
+`status` is `queued`, `delivered` or `expired`; every timestamp is RFC3339 UTC
+ending in `Z` at millisecond precision, and `delivered_at` stays `null` until
+the device acknowledges the delivery.
+
+### `POST /devices/{deviceId}/commands`
+
+Creates a command and returns it with status `201`. The body is exactly
+`{"id": ..., "payload": ..., "expires_at": ...}`: `id` follows the usual
+identifier rule and is unique within the device, `payload` is any JSON value,
+and `expires_at` is a strict RFC3339 UTC timestamp ending in `Z` that must
+still be in the future when the command is received. A missing or unknown
+field, an illegal identifier, or an invalid or non-future `expires_at` is
+`400 validation_error`; the same command id on the same device under a fresh
+`Idempotency-Key` is `409 conflict`, while replaying a key returns the first
+response.
+
+### `GET /devices/{deviceId}/commands/{commandId}`
+
+Returns the command, or `404 not_found` when it does not exist.
+
+### Delivery
+
+A command is delivered only to a connection whose client id equals the device
+id, that connected with clean session = 0 and subscribed at QoS 1 to the exact
+topic `$commands/<deviceId>` — clean sessions, wildcard subscriptions, QoS 0
+subscriptions and every other client receive nothing. When such a connection
+is ready, queued commands are sent one at a time in creation order as QoS 1
+PUBLISH packets with RETAIN clear and payload `{"id": <id>, "payload":
+<value>}`. At most one command per device awaits its PUBACK; that PUBACK marks
+the command `delivered`, records `delivered_at` and releases the next command.
+A disconnect before the PUBACK follows the usual persistent-session rules: the
+command is resent with its original packet id and `DUP=1`. Unrelated or
+duplicate PUBACKs change nothing.
+
+A queued command whose `expires_at` is reached without being delivered becomes
+`expired` and is never sent; the judgement runs on every query and before
+every delivery. Command delivery bypasses the publication pipeline entirely:
+it triggers no `mqtt` rules, writes no events and stores no retained message.
+
 ## Rules
 
 A rule is created once and never changes:
@@ -406,6 +458,25 @@ curl -s -X POST http://127.0.0.1:8080/devices/sensor-1/reported \
 
 Returns the current document, or `404` when the device has never reported.
 
+### `POST /devices/{deviceId}/commands`
+
+Creates a persistent offline command and returns it with status `201`.
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/devices/sensor-1/commands \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cmd-1' \
+  -d '{"id":"reboot","payload":{"delay":5},"expires_at":"2024-05-01T11:00:00Z"}'
+```
+```json
+{"device_id":"sensor-1","id":"reboot","payload":{"delay":5},"status":"queued",
+ "created_at":"2024-05-01T10:00:00.000Z","expires_at":"2024-05-01T11:00:00.000Z",
+ "delivered_at":null}
+```
+
+### `GET /devices/{deviceId}/commands/{commandId}`
+
+Returns the command, or `404` when the device has no such command.
+
 ### `POST /rules`
 
 Creates a rule and returns it with status `201`. A duplicate rule id is `409`.
@@ -452,9 +523,9 @@ and repeating a query against an unchanged event set returns the same events.
 
 | Code | Status | Raised by |
 | --- | --- | --- |
-| `validation_error` | 400 | malformed JSON, wrong content type, unknown or missing field, invalid identifier, topic filter, path, operator or event name |
-| `not_found` | 404 | unknown route, unknown device shadow |
-| `conflict` | 409 | duplicate rule id, `Idempotency-Key` reused for another operation |
+| `validation_error` | 400 | malformed JSON, wrong content type, unknown or missing field, invalid identifier, topic filter, path, operator, event name or command expiry |
+| `not_found` | 404 | unknown route, unknown device shadow, unknown command |
+| `conflict` | 409 | duplicate rule id, duplicate command id, `Idempotency-Key` reused for another operation |
 | `protocol_error` | — | MQTT transport only: the broker closes the connection |
 
 ## Tests
@@ -463,6 +534,6 @@ and repeating a query against an unchanged event set returns the same events.
 node --test tests/
 ```
 
-`node --test` and `node --test "tests/*.test.js"` run the same 111 tests;
+`node --test` and `node --test "tests/*.test.js"` run the same 123 tests;
 `tests/index.js` exists so the directory form also works on Node 22, which does
 not expand a directory argument on its own.
